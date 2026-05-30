@@ -1,6 +1,7 @@
 mod capture;
 mod frame;
 mod render;
+mod session;
 
 use std::fs;
 use std::io::{self, Read};
@@ -20,9 +21,12 @@ const ROOT_EXAMPLES: &str = "\
 Examples:
   cellshot capture --out captures/app -- my-terminal-app
   cellshot capture --cols 100 --rows 32 --wait-for 'Commands' -s ctrl-p --out captures/menu -- my-terminal-app
+  cellshot launch --name demo --host opentui -- opencode
+  cellshot wait demo '/connect' && cellshot send demo text:/connect enter
+  cellshot snapshot demo --out captures/provider && cellshot close demo
   printf '\\033[32msuccess\\033[0m\\n' | cellshot ansi --out captures/stdin
 
-Run `cellshot capture --help` for TUI-driving timing and interaction options.";
+Use `capture` for one final state or `launch` plus session commands for multi-step workflows.";
 
 const CAPTURE_HELP: &str = "\
 Capture flow:
@@ -35,8 +39,8 @@ Capture flow:
 Use --wait-for whenever an interaction must occur only after a UI is mounted. If its text is not
 visible before the command exits or deadline expires, capture fails rather than exporting the
 wrong screen. Send keys by name and text as `text:<value>`, for example `-s ctrl-p text:model
-enter`. This release supports a single post-readiness input burst, not
-multi-step sessions.
+enter`. For multiple interaction steps on one live application, use `launch`, `wait`, `send`,
+`snapshot`, and `close` instead of `capture`.
 
 Use `--host opentui` only for OpenTUI applications, including OpenCode, that query terminal
 capabilities before painting their interface. Generic programs do not need a host profile.
@@ -54,6 +58,27 @@ and exports the final visible frame.
 Examples:
   printf '\\033[44;97m status \\033[0m\\n' | cellshot ansi --out captures/status
   cellshot ansi --cols 120 --rows 40 --input debug.ansi --out captures/replay";
+
+const LAUNCH_HELP: &str = "\
+Launch starts one background PTY session and returns once its local control socket is available.
+The application stays alive until `cellshot close NAME`, so later commands interact with the
+same screen and application state. Persistent sessions currently require macOS or Linux.
+
+Example:
+  cellshot launch --name demo --host opentui --cols 112 --rows 34 -- opencode
+  cellshot wait demo '/connect'
+  cellshot send demo text:/connect enter
+  cellshot wait demo 'Connect a provider'
+  cellshot snapshot demo --out captures/provider
+  cellshot close demo";
+
+const SEND_HELP: &str = "\
+Send one ordered input burst to a live session. Key names are `ctrl-p`, `enter`, `escape`, `up`,
+`down`, `left`, `right`, and `tab`; text uses `text:<value>`.
+
+Examples:
+  cellshot send demo ctrl-p text:model enter
+  cellshot send demo text:/connect enter";
 
 #[derive(Parser)]
 #[command(
@@ -73,19 +98,27 @@ enum Command {
     /// Run a terminal command under a PTY and capture its settled screen.
     #[command(long_about = "Run a terminal command under a PTY and capture its settled visible screen.", after_help = CAPTURE_HELP)]
     Capture(CaptureArgs),
+    /// Start a named persistent terminal session.
+    #[command(after_help = LAUNCH_HELP)]
+    Launch(LaunchArgs),
+    /// Wait until a named session includes visible text.
+    Wait(WaitArgs),
+    /// Send ordered input to a named session.
+    #[command(after_help = SEND_HELP)]
+    Send(SendArgs),
+    /// Export the current settled screen from a named session.
+    Snapshot(SnapshotArgs),
+    /// Terminate a named session.
+    Close(SessionArgs),
     /// Render ANSI/VT bytes from a file or stdin without spawning a process.
     #[command(long_about = "Render ANSI/VT bytes from a file or stdin without spawning a process.", after_help = ANSI_HELP)]
     Ansi(AnsiArgs),
+    #[command(name = "__serve", hide = true)]
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
-struct OutputArgs {
-    /// Terminal width in cells.
-    #[arg(long, default_value_t = 80)]
-    cols: u16,
-    /// Terminal height in cells.
-    #[arg(long, default_value_t = 24)]
-    rows: u16,
+struct RenderArgs {
     /// Cell width used for terminal geometry and rendering.
     #[arg(long, default_value_t = 9)]
     cell_width: u16,
@@ -116,6 +149,18 @@ struct OutputArgs {
     /// Do not write the SVG artifact.
     #[arg(long)]
     no_svg: bool,
+}
+
+#[derive(Args)]
+struct OutputArgs {
+    /// Terminal width in cells.
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+    /// Terminal height in cells.
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+    #[command(flatten)]
+    render: RenderArgs,
 }
 
 #[derive(Args)]
@@ -152,6 +197,99 @@ struct CaptureArgs {
 }
 
 #[derive(Args)]
+struct LaunchArgs {
+    /// Stable local name used by later session commands.
+    #[arg(long)]
+    name: String,
+    /// Terminal width in cells.
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+    /// Terminal height in cells.
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+    /// Terminal cell width in pixels.
+    #[arg(long, default_value_t = 9)]
+    cell_width: u16,
+    /// Terminal cell height in pixels.
+    #[arg(long, default_value_t = 18)]
+    cell_height: u16,
+    /// Maximum raw terminal bytes retained by the live session.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_bytes: usize,
+    /// Working directory for the terminal command.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Terminal-host compatibility response profile.
+    #[arg(long, value_enum)]
+    host: Option<HostProfile>,
+    /// Command and arguments to launch, following `--`.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
+struct WaitArgs {
+    /// Name of a running session.
+    name: String,
+    /// Visible text that must appear in the session screen.
+    text: String,
+    /// Maximum time to wait before returning an error.
+    #[arg(long, default_value_t = 5000)]
+    timeout_ms: u64,
+}
+
+#[derive(Args)]
+struct SendArgs {
+    /// Name of a running session.
+    name: String,
+    /// Ordered input: key name or `text:<value>`.
+    #[arg(value_name = "INPUT", num_args = 1..)]
+    input: Vec<String>,
+}
+
+#[derive(Args)]
+struct SnapshotArgs {
+    /// Name of a running session.
+    name: String,
+    #[command(flatten)]
+    output: RenderArgs,
+    /// Wait for this many milliseconds without output before freezing the frame.
+    #[arg(long, default_value_t = 250)]
+    settle_ms: u64,
+    /// Return a frame after this deadline even if output continues.
+    #[arg(long, default_value_t = 5000)]
+    deadline_ms: u64,
+}
+
+#[derive(Args)]
+struct SessionArgs {
+    /// Name of a running session.
+    name: String,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    #[arg(long)]
+    socket: PathBuf,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    opentui_host: bool,
+    #[arg(long)]
+    cols: u16,
+    #[arg(long)]
+    rows: u16,
+    #[arg(long)]
+    cell_width: u16,
+    #[arg(long)]
+    cell_height: u16,
+    #[arg(long)]
+    max_bytes: usize,
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
 struct AnsiArgs {
     #[command(flatten)]
     output: OutputArgs,
@@ -175,8 +313,8 @@ fn main() -> Result<()> {
             let options = capture::Options {
                 cols: args.output.cols,
                 rows: args.output.rows,
-                cell_width: args.output.cell_width,
-                cell_height: args.output.cell_height,
+                cell_width: args.output.render.cell_width,
+                cell_height: args.output.render.cell_height,
                 settle: Duration::from_millis(args.settle_ms),
                 deadline: Duration::from_millis(args.deadline_ms),
                 input: capture_input(&args.send)?,
@@ -186,7 +324,49 @@ fn main() -> Result<()> {
                 opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
             };
             let captured = capture::command(&args.command, args.cwd.as_deref(), &options)?;
+            write_outputs(&captured, &args.output.render)?;
+        }
+        Command::Launch(args) => {
+            session::launch(
+                &args.name,
+                &args.command,
+                args.cwd.as_deref(),
+                &capture::Options {
+                    cols: args.cols,
+                    rows: args.rows,
+                    cell_width: args.cell_width,
+                    cell_height: args.cell_height,
+                    settle: Duration::ZERO,
+                    deadline: Duration::ZERO,
+                    input: Vec::new(),
+                    initial_delay: Duration::ZERO,
+                    wait_for: None,
+                    max_bytes: args.max_bytes,
+                    opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+                },
+            )?;
+            println!("{}", args.name);
+        }
+        Command::Wait(args) => {
+            session::wait(
+                &args.name,
+                args.text,
+                Duration::from_millis(args.timeout_ms),
+            )?;
+        }
+        Command::Send(args) => {
+            session::send(&args.name, capture_input(&args.input)?)?;
+        }
+        Command::Snapshot(args) => {
+            let captured = session::snapshot(
+                &args.name,
+                Duration::from_millis(args.settle_ms),
+                Duration::from_millis(args.deadline_ms),
+            )?;
             write_outputs(&captured, &args.output)?;
+        }
+        Command::Close(args) => {
+            session::close(&args.name)?;
         }
         Command::Ansi(args) => {
             let mut input = Vec::new();
@@ -208,7 +388,27 @@ fn main() -> Result<()> {
             }
             let captured =
                 capture::ansi(input, args.output.rows, args.output.cols, args.max_bytes)?;
-            write_outputs(&captured, &args.output)?;
+            write_outputs(&captured, &args.output.render)?;
+        }
+        Command::Serve(args) => {
+            session::serve(
+                args.socket,
+                args.command,
+                args.cwd,
+                capture::Options {
+                    cols: args.cols,
+                    rows: args.rows,
+                    cell_width: args.cell_width,
+                    cell_height: args.cell_height,
+                    settle: Duration::ZERO,
+                    deadline: Duration::ZERO,
+                    input: Vec::new(),
+                    initial_delay: Duration::ZERO,
+                    wait_for: None,
+                    max_bytes: args.max_bytes,
+                    opentui_host: args.opentui_host,
+                },
+            )?;
         }
     }
     Ok(())
@@ -238,7 +438,7 @@ fn capture_input(events: &[String]) -> Result<Vec<u8>> {
     Ok(input)
 }
 
-fn write_outputs(captured: &capture::Captured, args: &OutputArgs) -> Result<()> {
+fn write_outputs(captured: &capture::Captured, args: &RenderArgs) -> Result<()> {
     if let Some(parent) = args
         .out
         .parent()

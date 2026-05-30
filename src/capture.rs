@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use vt100::Parser;
 
 use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, Frame, from_screen};
@@ -26,6 +27,7 @@ pub struct Options {
     pub opentui_host: bool,
 }
 
+#[derive(Deserialize, Serialize)]
 pub struct Captured {
     pub frame: Frame,
     pub ansi: Vec<u8>,
@@ -90,14 +92,7 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
     let result = (|| {
         let mut terminal = terminal(options.rows, options.cols);
         let mut ansi = Vec::new();
-        let mut host = Host {
-            writer,
-            enabled: options.opentui_host,
-            opentui_replied: false,
-            probe: Vec::new(),
-            pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
-            pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
-        };
+        let mut host = Host::new(writer, options);
         let started = Instant::now();
         let deadline = started + options.deadline;
         let closed = consume_until_ready(
@@ -117,10 +112,7 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
             );
         }
         if !closed && Instant::now() < deadline && !options.input.is_empty() {
-            host.writer
-                .write_all(&options.input)
-                .context("send terminal input")?;
-            host.writer.flush().context("flush terminal input")?;
+            host.send(&options.input)?;
             consume_until_settled(
                 &receive,
                 &mut terminal,
@@ -155,7 +147,7 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
     result
 }
 
-fn terminal(rows: u16, cols: u16) -> Parser {
+pub(crate) fn terminal(rows: u16, cols: u16) -> Parser {
     Parser::new(rows, cols, 0)
 }
 
@@ -257,7 +249,7 @@ fn consume_until_settled(
     }
 }
 
-fn retain(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> Result<()> {
+pub(crate) fn retain(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> Result<()> {
     if ansi.len() + bytes.len() > max_bytes {
         bail!("terminal output exceeds --max-bytes ({max_bytes})");
     }
@@ -265,7 +257,7 @@ fn retain(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-struct Host {
+pub(crate) struct Host {
     writer: Box<dyn Write + Send>,
     enabled: bool,
     opentui_replied: bool,
@@ -275,7 +267,25 @@ struct Host {
 }
 
 impl Host {
-    fn respond(&mut self, output: &[u8]) -> Result<()> {
+    pub(crate) fn new(writer: Box<dyn Write + Send>, options: &Options) -> Self {
+        Self {
+            writer,
+            enabled: options.opentui_host,
+            opentui_replied: false,
+            probe: Vec::new(),
+            pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
+            pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
+        }
+    }
+
+    pub(crate) fn send(&mut self, input: &[u8]) -> Result<()> {
+        self.writer
+            .write_all(input)
+            .context("send terminal input")?;
+        self.writer.flush().context("flush terminal input")
+    }
+
+    pub(crate) fn respond(&mut self, output: &[u8]) -> Result<()> {
         if !self.enabled || self.opentui_replied {
             return Ok(());
         }
@@ -341,14 +351,22 @@ mod tests {
     #[test]
     fn responds_to_split_opentui_query_with_requested_geometry() {
         let result = Arc::new(Mutex::new(Vec::new()));
-        let mut host = Host {
-            writer: Box::new(Writer(result.clone())),
-            enabled: true,
-            opentui_replied: false,
-            probe: Vec::new(),
-            pixel_width: 900,
-            pixel_height: 480,
-        };
+        let mut host = Host::new(
+            Box::new(Writer(result.clone())),
+            &Options {
+                cols: 100,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 20,
+                settle: Duration::ZERO,
+                deadline: Duration::ZERO,
+                input: Vec::new(),
+                initial_delay: Duration::ZERO,
+                wait_for: None,
+                max_bytes: 1,
+                opentui_host: true,
+            },
+        );
 
         host.respond(b"\x1b]10;?\x07").unwrap();
         host.respond(b"\x1b]11;?\x07").unwrap();

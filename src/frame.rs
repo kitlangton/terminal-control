@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use vt100::{Color as TerminalColor, Screen};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -25,7 +25,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Attributes {
     pub bold: bool,
     pub italic: bool,
@@ -36,13 +36,13 @@ pub struct Attributes {
     pub underline: Option<Underline>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Underline {
     Single,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Cell {
     pub x: u16,
     pub y: u16,
@@ -53,7 +53,7 @@ pub struct Cell {
     pub attributes: Attributes,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Cursor {
     pub x: u16,
     pub y: u16,
@@ -61,7 +61,7 @@ pub struct Cursor {
     pub blinking: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Frame {
     pub version: u8,
     pub cols: u16,

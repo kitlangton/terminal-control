@@ -12,7 +12,7 @@ Native terminal visual capture for agents, TUI developers, and review workflows.
 
 PNG artifacts render at 2x pixel density by default for sharp HiDPI viewing. SVG artifacts remain resolution-independent.
 
-This is the first vertical slice of a larger goal: a small native replacement for terminal automation tools that can launch, drive, capture, diff, and remotely inspect interactive terminal applications.
+`cellshot` supports both a concise one-shot capture path and named persistent sessions for multi-step terminal interaction.
 
 ## Requirements
 
@@ -47,6 +47,26 @@ cargo install --locked --path cellshot
 The repository is a binary crate: the installed product is the `cellshot` executable. No application embedding API is promised yet.
 
 ## Usage
+
+### Persistent Sessions
+
+Use a persistent session when an agent needs to inspect and drive more than one state of the same running application:
+
+```bash
+cellshot launch --name demo --host opentui --cols 112 --rows 34 -- opencode
+cellshot wait demo "/connect"
+cellshot snapshot demo --out captures/home
+cellshot send demo text:/connect enter
+cellshot wait demo "Connect a provider"
+cellshot snapshot demo --out captures/provider
+cellshot close demo
+```
+
+`launch` creates a background local PTY owner for the named session. `wait`, `send`, and `snapshot` are separate CLI invocations connected to that same live process, so an agent can navigate a TUI and capture several states without restarting it. Session control currently uses local Unix sockets and therefore supports macOS and Linux.
+
+Use `cellshot close <name>` when finished. If an earlier controller process crashes, relaunching the same name cleans up a stale session socket once no running daemon responds.
+
+### One-Shot Capture
 
 Capture a real PTY command after its screen output becomes idle:
 
@@ -96,7 +116,7 @@ captures/colors.ansi
 
 ## Agent Quick Reference
 
-An agent driving a TUI should use this sequence:
+An agent driving a single target TUI state can use `capture`:
 
 1. Run `cellshot capture --cols <width> --rows <height> --out <stem> -- <command> [args...]` for a static initial screen.
 2. Add `--wait-for '<visible text>'` before `-s` / `--send` when opening a dialog or selecting a view. A missing readiness checkpoint is an error, not a screenshot.
@@ -104,7 +124,15 @@ An agent driving a TUI should use this sequence:
 4. Read `<stem>.txt` to confirm visible labels and `<stem>.json` for structured cells; open `<stem>.png` for visual review. Keep `<stem>.ansi` when diagnosing parsing or host-handshake behavior.
 5. Increase `--deadline-ms` when startup is slow, increase `--settle-ms` for animations, and use `--pixel-ratio 1` only when a smaller PNG matters more than sharp review output.
 
-`capture` writes SVG and PNG visual output plus JSON, text, and raw ANSI artifacts. Use `--no-png` or `--no-svg` only to skip the corresponding visual file. `ansi` performs the same export from a recorded terminal stream or stdin without launching a process.
+For multiple states in one live TUI, prefer this sequence:
+
+1. Run `cellshot launch --name <session> [--host opentui] -- <command> [args...]` once.
+2. Run `cellshot wait <session> '<visible text>'` before interacting with each expected view.
+3. Run `cellshot snapshot <session> --out <stem>` at each state worth reviewing.
+4. Run `cellshot send <session> ctrl-p text:model enter` to continue navigating without relaunching.
+5. Run `cellshot close <session>` when finished.
+
+Both `capture` and `snapshot` write SVG and PNG visual output plus JSON, text, and raw ANSI artifacts. Use `--no-png` or `--no-svg` only to skip the corresponding visual file. `ansi` performs the same export from a recorded terminal stream or stdin without launching a process.
 
 ### Example Agent Calls
 
@@ -132,7 +160,7 @@ cellshot capture --cols 112 --rows 34 --deadline-ms 10000 \
   --out /tmp/opencode-connect -- opencode
 ```
 
-This is efficient for one target state: one PTY launch produces all artifact types and an ordered input burst avoids relaunching solely for `type -> enter` flows. `--send` remains repeatable when constructing commands programmatically, while `-s ctrl-p text:model enter` is the concise human/agent form. It is not yet efficient for a gallery of several states in the same session; a future session API will keep one TUI alive while taking multiple snapshots.
+`capture` is efficient for one target state: one PTY launch produces all artifact types and an ordered input burst avoids relaunching solely for `type -> enter` flows. `--send` remains repeatable when constructing one-shot commands programmatically, while `-s ctrl-p text:model enter` is the concise form. Persistent sessions are efficient for galleries and longer navigation flows because the TUI remains alive between snapshots.
 
 Use `--host opentui` for OpenTUI programs such as OpenCode that request terminal capability responses during startup. Leave it unset for ordinary terminal programs; the generic capture path does not impersonate a richer terminal host.
 
@@ -141,6 +169,7 @@ Use `--host opentui` for OpenTUI programs such as OpenCode that request terminal
 Implemented now:
 
 - PTY command launch at explicit terminal dimensions.
+- Named persistent sessions with `launch`, `wait`, `send`, `snapshot`, and `close` on macOS/Linux.
 - Idle/deadline snapshot capture for running applications.
 - Ordered post-readiness input for driving menus and forms (`-s` / `--send`).
 - Initial delay and visible-text gates for applications that log before mounting a TUI.
@@ -168,8 +197,8 @@ The host-handshake logic is currently intentionally narrow: it identifies the Op
 
 Next layers:
 
-- Persistent named sessions and a local daemon.
-- `type`, `press`, `click`, `resize`, `wait`, and `wait-idle` controls.
+- Resize and coordinate/click controls for live sessions.
+- Session listing, crash metadata, and explicit daemon lifecycle/status inspection.
 - Timestamped input/output recording and deterministic replay into screenshot sequences, animated images, or encoded video.
 - HTML galleries and cell-level visual diffs.
 - Native attach UI.
