@@ -25,7 +25,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Attributes {
     pub bold: bool,
     pub italic: bool,
@@ -36,13 +36,13 @@ pub struct Attributes {
     pub underline: Option<Underline>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Underline {
     Single,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Cell {
     pub x: u16,
     pub y: u16,
@@ -53,7 +53,7 @@ pub struct Cell {
     pub attributes: Attributes,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Cursor {
     pub x: u16,
     pub y: u16,
@@ -61,7 +61,7 @@ pub struct Cursor {
     pub blinking: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Frame {
     pub version: u8,
     pub cols: u16,
@@ -73,6 +73,12 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn has_visible_content(&self) -> bool {
+        self.cells
+            .iter()
+            .any(|cell| !cell.text.trim().is_empty() || cell.background != self.background)
+    }
+
     pub fn text(&self) -> String {
         let mut rows =
             vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];

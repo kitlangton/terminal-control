@@ -10,7 +10,7 @@ use crate::capture::{Captured, Options};
 enum Request {
     Ping,
     Wait { text: String, timeout_ms: u64 },
-    Send { input: Vec<u8> },
+    Send { input: Vec<Vec<u8>>, pace_ms: u64 },
     Snapshot { settle_ms: u64, deadline_ms: u64 },
     Close,
 }
@@ -21,9 +21,15 @@ struct Response {
     captured: Option<Captured>,
 }
 
-pub fn launch(name: &str, command: &[String], cwd: Option<&Path>, options: &Options) -> Result<()> {
+pub fn launch(
+    name: &str,
+    command: &[String],
+    cwd: Option<&Path>,
+    record: Option<&Path>,
+    options: &Options,
+) -> Result<()> {
     validate_name(name)?;
-    implementation::launch(name, command, cwd, options)
+    implementation::launch(name, command, cwd, record, options)
 }
 
 pub fn wait(name: &str, text: String, timeout: Duration) -> Result<()> {
@@ -37,8 +43,14 @@ pub fn wait(name: &str, text: String, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-pub fn send(name: &str, input: Vec<u8>) -> Result<()> {
-    request(name, Request::Send { input })?;
+pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
+    request(
+        name,
+        Request::Send {
+            input,
+            pace_ms: pace.as_millis() as u64,
+        },
+    )?;
     Ok(())
 }
 
@@ -63,9 +75,10 @@ pub fn serve(
     socket: PathBuf,
     command: Vec<String>,
     cwd: Option<PathBuf>,
+    record: Option<PathBuf>,
     options: Options,
 ) -> Result<()> {
-    implementation::serve(socket, command, cwd, options)
+    implementation::serve(socket, command, cwd, record, options)
 }
 
 fn request(name: &str, request: Request) -> Result<Response> {
@@ -96,6 +109,7 @@ fn socket_path(name: &str) -> Result<PathBuf> {
 mod implementation {
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -110,6 +124,16 @@ mod implementation {
     use super::{Request, Response};
     use crate::capture::{self, Captured, Host, Options};
     use crate::frame::from_screen;
+    use crate::recording::{self, InputOrigin};
+
+    const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+    const OUTPUT_BATCH: usize = 32;
+
+    struct Output {
+        at_ms: u64,
+        bytes: Vec<u8>,
+    }
 
     pub fn runtime_dir() -> Result<PathBuf> {
         let path = std::env::var_os("CELLSHOT_RUNTIME_DIR")
@@ -117,14 +141,42 @@ mod implementation {
             .unwrap_or_else(|| {
                 PathBuf::from(format!("/tmp/cellshot-{}", unsafe { libc::geteuid() }))
             });
-        fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => require_private_runtime_dir(&path, &metadata)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .with_context(|| format!("create {}", path.display()))?;
+            }
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure {}", path.display()))?;
         Ok(path)
+    }
+
+    fn require_private_runtime_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "session runtime path must be a real directory: {}",
+                path.display()
+            );
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "session runtime directory is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     pub fn launch(
         name: &str,
         command: &[String],
         cwd: Option<&Path>,
+        record: Option<&Path>,
         options: &Options,
     ) -> Result<()> {
         if command.is_empty() {
@@ -160,6 +212,16 @@ mod implementation {
         }
         if let Some(cwd) = cwd {
             daemon.arg("--cwd").arg(cwd);
+        }
+        if let Some(record) = record {
+            let record = if record.is_absolute() {
+                record.to_owned()
+            } else {
+                std::env::current_dir()
+                    .context("resolve recording output directory")?
+                    .join(record)
+            };
+            daemon.arg("--record").arg(record);
         }
         daemon
             .arg("--")
@@ -200,9 +262,34 @@ mod implementation {
         socket: PathBuf,
         command: Vec<String>,
         cwd: Option<PathBuf>,
+        record: Option<PathBuf>,
         options: Options,
     ) -> Result<()> {
         ensure_socket_path(&socket)?;
+        if command.is_empty() {
+            bail!("provide a command after --");
+        }
+        let started = Instant::now();
+        let recording = record
+            .as_deref()
+            .map(|path| {
+                recording::Writer::new(
+                    path,
+                    started,
+                    options.cols,
+                    options.rows,
+                    options.cell_width,
+                    options.cell_height,
+                )
+            })
+            .transpose()?;
+        let listener =
+            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure {}", socket.display()))?;
+        listener
+            .set_nonblocking(true)
+            .context("set session socket nonblocking")?;
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: options.rows,
@@ -239,7 +326,13 @@ mod implementation {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(len) => {
-                        if send.send(Some(buffer[..len].to_vec())).is_err() {
+                        if send
+                            .send(Some(Output {
+                                at_ms: started.elapsed().as_millis() as u64,
+                                bytes: buffer[..len].to_vec(),
+                            }))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -248,11 +341,6 @@ mod implementation {
             }
             let _ = send.send(None);
         });
-        let listener =
-            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("set session socket nonblocking")?;
         let mut state = State {
             parser: capture::terminal(options.rows, options.cols),
             ansi: Vec::new(),
@@ -261,6 +349,7 @@ mod implementation {
             max_bytes: options.max_bytes,
             closed: false,
             last_output: None,
+            recording,
         };
         let result = run(&listener, &mut state);
         if let Some(process_group) = process_group {
@@ -287,27 +376,8 @@ mod implementation {
         loop {
             state.consume()?;
             match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream
-                        .set_nonblocking(false)
-                        .context("set session connection blocking")?;
-                    let request =
-                        serde_json::from_reader(&mut stream).context("parse session request")?;
-                    let close = matches!(request, Request::Close);
-                    let response = match state.respond(request) {
-                        Ok(captured) => Response {
-                            error: None,
-                            captured,
-                        },
-                        Err(error) => Response {
-                            error: Some(format!("{error:#}")),
-                            captured: None,
-                        },
-                    };
-                    serde_json::to_writer(&mut stream, &response)
-                        .context("write session response")?;
-                    stream.flush().context("flush session response")?;
-                    if close {
+                Ok((stream, _)) => {
+                    if handle(stream, state)? {
                         return Ok(());
                     }
                 }
@@ -319,24 +389,89 @@ mod implementation {
         }
     }
 
+    fn handle(mut stream: UnixStream, state: &mut State) -> Result<bool> {
+        stream
+            .set_nonblocking(false)
+            .context("set session connection blocking")?;
+        stream
+            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .context("set session request timeout")?;
+        stream
+            .set_write_timeout(Some(CONTROL_TIMEOUT))
+            .context("set session response timeout")?;
+        let mut bytes = Vec::new();
+        let response = match Read::by_ref(&mut stream)
+            .take(MAX_REQUEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+        {
+            Ok(_) if bytes.len() as u64 > MAX_REQUEST_BYTES => Response {
+                error: Some("session request exceeds 1 MiB".to_owned()),
+                captured: None,
+            },
+            Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
+                Ok(request) => {
+                    let close = matches!(request, Request::Close);
+                    let response = match state.respond(request) {
+                        Ok(captured) => Response {
+                            error: None,
+                            captured,
+                        },
+                        Err(error) => Response {
+                            error: Some(format!("{error:#}")),
+                            captured: None,
+                        },
+                    };
+                    if write_response(&mut stream, &response).is_ok() && close {
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                Err(error) => Response {
+                    error: Some(format!("invalid session request: {error}")),
+                    captured: None,
+                },
+            },
+            Err(error) => Response {
+                error: Some(format!("failed to read session request: {error}")),
+                captured: None,
+            },
+        };
+        let _ = write_response(&mut stream, &response);
+        Ok(false)
+    }
+
+    fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
+        serde_json::to_writer(&mut *stream, response).context("write session response")?;
+        stream.flush().context("flush session response")
+    }
+
     struct State {
         parser: Parser,
         ansi: Vec<u8>,
         host: Host,
-        receive: Receiver<Option<Vec<u8>>>,
+        receive: Receiver<Option<Output>>,
         max_bytes: usize,
         closed: bool,
         last_output: Option<Instant>,
+        recording: Option<recording::Writer>,
     }
 
     impl State {
         fn consume(&mut self) -> Result<()> {
-            loop {
+            for _ in 0..OUTPUT_BATCH {
                 match self.receive.try_recv() {
-                    Ok(Some(bytes)) => {
-                        self.host.respond(&bytes)?;
-                        capture::retain(&mut self.ansi, &bytes, self.max_bytes)?;
-                        self.parser.process(&bytes);
+                    Ok(Some(output)) => {
+                        if let Some(recording) = &mut self.recording {
+                            recording.output(output.at_ms, &output.bytes)?;
+                        }
+                        let response = self.host.respond(&output.bytes)?;
+                        if !response.is_empty()
+                            && let Some(recording) = &mut self.recording
+                        {
+                            recording.input(InputOrigin::Host, &response)?;
+                        }
+                        capture::retain(&mut self.ansi, &output.bytes, self.max_bytes)?;
+                        self.parser.process(&output.bytes);
                         self.last_output = Some(Instant::now());
                     }
                     Ok(None) | Err(TryRecvError::Disconnected) => {
@@ -346,16 +481,27 @@ mod implementation {
                     Err(TryRecvError::Empty) => return Ok(()),
                 }
             }
+            Ok(())
         }
 
         fn respond(&mut self, request: Request) -> Result<Option<Captured>> {
             match request {
                 Request::Ping => Ok(None),
-                Request::Send { input } => {
+                Request::Send { input, pace_ms } => {
                     if self.closed {
                         bail!("session command has exited");
                     }
-                    self.host.send(&input)?;
+                    let last = input.len().saturating_sub(1);
+                    for (index, bytes) in input.into_iter().enumerate() {
+                        self.host.send(&bytes)?;
+                        if let Some(recording) = &mut self.recording {
+                            recording.input(InputOrigin::Client, &bytes)?;
+                        }
+                        if pace_ms > 0 && index < last {
+                            thread::sleep(Duration::from_millis(pace_ms));
+                            self.consume()?;
+                        }
+                    }
                     Ok(None)
                 }
                 Request::Wait { text, timeout_ms } => {
@@ -410,13 +556,25 @@ mod implementation {
     pub fn runtime_dir() -> Result<PathBuf> {
         bail!("persistent sessions require Unix sockets")
     }
-    pub fn launch(_: &str, _: &[String], _: Option<&Path>, _: &Options) -> Result<()> {
+    pub fn launch(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+    ) -> Result<()> {
         bail!("persistent sessions require Unix sockets")
     }
     pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
         bail!("persistent sessions require Unix sockets")
     }
-    pub fn serve(_: PathBuf, _: Vec<String>, _: Option<PathBuf>, _: Options) -> Result<()> {
+    pub fn serve(
+        _: PathBuf,
+        _: Vec<String>,
+        _: Option<PathBuf>,
+        _: Option<PathBuf>,
+        _: Options,
+    ) -> Result<()> {
         bail!("persistent sessions require Unix sockets")
     }
 }

@@ -142,9 +142,8 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         '▛' => single(0.0, 0.0, 0.5, 1.0) + &single(0.5, 0.0, 0.5, 0.5),
         '▜' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.0, 0.5, 0.5),
         '▟' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.5, 0.5, 0.5),
-        '░' => rect(x, y, width, height, Some(0.25)),
-        '▒' => rect(x, y, width, height, Some(0.5)),
-        '▓' => rect(x, y, width, height, Some(0.75)),
+        '■' => single(0.1, 0.18, 0.8, 0.64),
+        '⬝' => single(0.32, 0.38, 0.36, 0.28),
         _ => return None,
     })
 }
@@ -272,5 +271,85 @@ mod tests {
 
         assert!(output.contains("height=\"9\""));
         assert!(!output.contains(">▀</text>"));
+    }
+
+    #[test]
+    fn renders_opencode_spinner_squares_as_geometry() {
+        let frame = Frame {
+            version: 1,
+            cols: 2,
+            rows: 1,
+            foreground: Color {
+                r: 80,
+                g: 140,
+                b: 220,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: ["■", "⬝"]
+                .into_iter()
+                .enumerate()
+                .map(|(x, text)| crate::frame::Cell {
+                    x: x as u16,
+                    y: 0,
+                    text: text.to_owned(),
+                    width: 1,
+                    foreground: Color {
+                        r: 80,
+                        g: 140,
+                        b: 220,
+                    },
+                    background: Color { r: 0, g: 0, b: 0 },
+                    attributes: Attributes::default(),
+                })
+                .collect(),
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        assert!(!output.contains(">■</text>"));
+        assert!(!output.contains(">⬝</text>"));
+    }
+
+    #[test]
+    fn renders_shade_characters_as_font_glyphs() {
+        let frame = Frame {
+            version: 1,
+            cols: 3,
+            rows: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: ["░", "▒", "▓"]
+                .into_iter()
+                .enumerate()
+                .map(|(x, text)| crate::frame::Cell {
+                    x: x as u16,
+                    y: 0,
+                    text: text.to_owned(),
+                    width: 1,
+                    foreground: Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                    },
+                    background: Color { r: 0, g: 0, b: 0 },
+                    attributes: Attributes::default(),
+                })
+                .collect(),
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        assert!(output.contains(">░</text>"));
+        assert!(output.contains(">▒</text>"));
+        assert!(output.contains(">▓</text>"));
+        assert!(!output.contains("opacity=\"0.25\""));
+        assert!(!output.contains("opacity=\"0.5\""));
+        assert!(!output.contains("opacity=\"0.75\""));
     }
 }

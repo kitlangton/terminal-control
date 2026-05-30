@@ -33,8 +33,8 @@ Both images were produced from one live TUI process using the session API:
 cellshot launch --name meta --host opentui --cols 112 --rows 35 -- opencode
 cellshot wait meta "Ask anything"
 cellshot snapshot meta --hide-cursor --out docs/screenshots/opencode-home
-cellshot send meta 'text:Write exactly three tiny haikus about cellshot photographing OpenCode while you answer. Start with the exact words Pixel paparazzi. Keep it playful and do not use tools.' enter
-cellshot wait meta "Shutter clicks, code froze." --timeout-ms 60000
+cellshot send meta --pace-ms 35 'text:Write exactly three tiny haikus about cellshot photographing OpenCode while you answer. Start with the exact words Pixel paparazzi. Keep it playful and do not use tools.' enter
+cellshot wait meta "Build · Big Pickle ·" --timeout-ms 60000
 cellshot snapshot meta --hide-cursor --out docs/screenshots/opencode-haikus
 cellshot close meta
 ```
@@ -86,7 +86,24 @@ cellshot close demo
 
 `launch` creates a background local PTY owner for the named session. `wait`, `send`, and `snapshot` are separate CLI invocations connected to that same live process, so an agent can navigate a TUI and capture several states without restarting it. Session control currently uses local Unix sockets and therefore supports macOS and Linux.
 
-Use `cellshot close <name>` when finished. If an earlier controller process crashes, relaunching the same name cleans up a stale session socket once no running daemon responds.
+Use `cellshot close <name>` when finished. Session sockets are owner-only local control endpoints, but they control a live terminal application and can expose its visible contents. If an earlier controller process crashes, relaunching the same name cleans up a stale session socket once no running daemon responds.
+
+### Record A Session
+
+Record a timestamped terminal timeline, then render a video with the real interaction timing preserved:
+
+```bash
+cellshot launch --name demo --record captures/demo.cellshot --host opentui -- opencode
+cellshot wait demo "Ask anything"
+cellshot send demo --pace-ms 35 'text:Write a tiny terminal haiku.' enter
+cellshot wait demo "haiku" --timeout-ms 60000
+cellshot close demo
+
+cellshot video captures/demo.cellshot --hide-cursor \
+  --out captures/demo.mp4
+```
+
+Recordings are JSON Lines timelines containing terminal output plus client and automatic host input observed until the session is closed. They may contain prompts, secrets, and terminal output; store them accordingly. Wait for the final visible state before `close` when recording a demo. Video export uses `ffmpeg`, omits leading terminal negotiation/blank frames by default, and preserves the original pace after the first visible terminal content. Use `--from-launch` to include startup frames or `--max-idle-ms 600` for an intentionally condensed demo; the `.cellshot` file retains its observed timing for debugging or future renderers.
 
 ### One-Shot Capture
 
@@ -98,6 +115,29 @@ cellshot capture --cols 90 --rows 28 --out captures/colors -- \
 ```
 
 Use `--pixel-ratio 1` when a smaller PNG is preferable, or `--pixel-ratio 3` for extra-large review assets.
+
+Some CLIs change behavior when stdout is a terminal. Use pipe mode for commands that only produce
+their useful output when stdout/stderr are ordinary pipes:
+
+```bash
+cellshot capture --mode pipe --cols 100 --rows 16 \
+  --out captures/streak -- bunx opcd-streak
+```
+
+Pipe mode does not support `--send` or `--host`; it runs the command with stdin closed, captures
+stdout and stderr, normalizes plain line feeds as terminal line endings, and renders the final
+visible frame through the same SVG/PNG/JSON/TXT/ANSI export path.
+
+When the surrounding agent environment disables color, force color for the captured command:
+
+```bash
+cellshot capture --color always --cols 100 --rows 16 \
+  --out captures/streak -- bunx opcd-streak
+```
+
+`--color always` removes `NO_COLOR` and sets common force-color variables for the child process.
+`--color never` sets common no-color variables. The default, `--color auto`, preserves the
+current environment.
 
 Capture a long-running terminal UI after an idle checkpoint or deadline:
 
@@ -145,6 +185,7 @@ An agent driving a single target TUI state can use `capture`:
 3. Add ordered input after one `-s` flag: key values are `ctrl-p`, `enter`, `escape`, `up`, `down`, `left`, `right`, and `tab`; typed input is `text:<value>`. Example: `-s ctrl-p text:model enter`. Quote events containing spaces, such as `-s ctrl-p 'text:dark mode' enter`.
 4. Read `<stem>.txt` to confirm visible labels and `<stem>.json` for structured cells; open `<stem>.png` for visual review. Keep `<stem>.ansi` when diagnosing parsing or host-handshake behavior.
 5. Increase `--deadline-ms` when startup is slow, increase `--settle-ms` for animations, and use `--pixel-ratio 1` only when a smaller PNG matters more than sharp review output.
+6. Use `--mode pipe` when a CLI emits useful output in ordinary shell capture but appears blank under the default PTY capture.
 
 For multiple states in one live TUI, prefer this sequence:
 
@@ -182,7 +223,7 @@ cellshot capture --cols 112 --rows 34 --deadline-ms 10000 \
   --out /tmp/opencode-connect -- opencode
 ```
 
-`capture` is efficient for one target state: one PTY launch produces all artifact types and an ordered input burst avoids relaunching solely for `type -> enter` flows. `--send` remains repeatable when constructing one-shot commands programmatically, while `-s ctrl-p text:model enter` is the concise form. Persistent sessions are efficient for galleries and longer navigation flows because the TUI remains alive between snapshots.
+`capture` is efficient for one disposable target state: it launches a command, freezes one frame, and terminates that process group. An ordered input burst avoids relaunching solely for `type -> enter` flows. `--send` remains repeatable when constructing one-shot commands programmatically, while `-s ctrl-p text:model enter` is the concise form. Persistent sessions are efficient for galleries, recording, and longer navigation flows because the TUI remains alive between snapshots.
 
 Use `--host opentui` for OpenTUI programs such as OpenCode that request terminal capability responses during startup. Leave it unset for ordinary terminal programs; the generic capture path does not impersonate a richer terminal host.
 
@@ -191,7 +232,9 @@ Use `--host opentui` for OpenTUI programs such as OpenCode that request terminal
 Implemented now:
 
 - PTY command launch at explicit terminal dimensions.
+- Pipe-backed command capture for non-interactive CLIs that suppress or alter output on a TTY.
 - Named persistent sessions with `launch`, `wait`, `send`, `snapshot`, and `close` on macOS/Linux.
+- Timestamped session recording plus real-time video export through `ffmpeg`, with optional idle compression.
 - Idle/deadline snapshot capture for running applications.
 - Ordered post-readiness input for driving menus and forms (`-s` / `--send`).
 - Initial delay and visible-text gates for applications that log before mounting a TUI.
@@ -207,13 +250,13 @@ Implemented now:
 
 ## OpenTUI Support
 
-`--host opentui` responds to the startup, palette, and graphics capability probes used by current OpenTUI applications such as OpenCode. It is deliberately opt-in so generic terminal commands are not given application-specific host responses. The terminal-host layer should continue to broaden before treating `cellshot` as a universal automation terminal.
+`--host opentui` responds to startup and palette capability probes used by current OpenTUI applications such as OpenCode. Kitty graphics are reported unavailable because the current `vt100` renderer does not decode image payloads; this avoids silently dropping application content that chooses a graphics path. The profile is deliberately opt-in so generic terminal commands are not given application-specific host responses.
 
 Next layers:
 
 - Resize and coordinate/click controls for live sessions.
 - Session listing, crash metadata, and explicit daemon lifecycle/status inspection.
-- Timestamped input/output recording and deterministic replay into screenshot sequences, animated images, or encoded video.
+- Recording manifests, annotations, alternative video formats, and richer playback controls.
 - HTML galleries and cell-level visual diffs.
 - Native attach UI.
 - Authenticated remote/SSH-forwarded control.

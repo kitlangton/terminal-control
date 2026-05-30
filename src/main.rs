@@ -1,5 +1,6 @@
 mod capture;
 mod frame;
+mod recording;
 mod render;
 mod session;
 
@@ -13,24 +14,28 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const HELP: &str = "\
 cellshot is built for terminal UI inspection and agent workflows. It executes a command in a
-real pseudo-terminal or renders existing ANSI input, then writes inspectable artifacts from the
-visible terminal frame. Use the .txt output to inspect content, .png/.svg for visual review,
-.json for structured processing, and .ansi to replay or diagnose the original terminal stream.";
+real pseudo-terminal, captures pipe-only command output, or renders existing ANSI input, then
+writes inspectable artifacts from the visible terminal frame. Use the .txt output to inspect
+content, .png/.svg for visual review, .json for structured processing, and .ansi to replay or
+diagnose the original terminal stream.";
 
 const ROOT_EXAMPLES: &str = "\
 Examples:
   cellshot capture --out captures/app -- my-terminal-app
   cellshot capture --cols 100 --rows 32 --wait-for 'Commands' -s ctrl-p --out captures/menu -- my-terminal-app
+  cellshot capture --mode pipe --out captures/log -- my-log-command
   cellshot launch --name demo --host opentui -- opencode
   cellshot wait demo '/connect' && cellshot send demo text:/connect enter
-  cellshot snapshot demo --out captures/provider && cellshot close demo
+  cellshot wait demo 'Connect a provider' && cellshot snapshot demo --out captures/provider
+  cellshot close demo
   printf '\\033[32msuccess\\033[0m\\n' | cellshot ansi --out captures/stdin
 
 Use `capture` for one final state or `launch` plus session commands for multi-step workflows.";
 
 const CAPTURE_HELP: &str = "\
 Capture flow:
-  1. Start COMMAND inside a PTY with TERM=xterm-truecolor.
+  1. Start COMMAND inside a PTY with TERM=xterm-truecolor, or use --mode pipe for commands
+     that only print when stdout/stderr are not terminals.
   2. Optionally wait for --initial-delay-ms and visible --wait-for text.
   3. If --send input is queued, send the ordered events as one input burst.
   4. Freeze the visible frame once PTY output is idle for --settle-ms or --deadline-ms expires.
@@ -44,11 +49,15 @@ enter`. For multiple interaction steps on one live application, use `launch`, `w
 
 Use `--host opentui` only for OpenTUI applications, including OpenCode, that query terminal
 capabilities before painting their interface. Generic programs do not need a host profile.
+Use `--mode pipe` for CLIs that skip output when stdout is a TTY; pipe mode captures stdout and
+stderr without terminal input, normalizing plain line feeds as terminal line endings.
+Use `--color always` to remove NO_COLOR and set common force-color environment variables.
 
 Examples:
   cellshot capture --host opentui --cols 100 --rows 32 --out captures/home -- opencode
   cellshot capture --host opentui --cols 100 --rows 32 --wait-for '/connect' -s ctrl-p text:model enter --out captures/model -- opencode
   cellshot capture --wait-for 'Choose model' -s down enter --out captures/chosen -- my-tui
+  cellshot capture --color always --cols 100 --rows 16 --out captures/streak -- bunx opcd-streak
   cellshot capture --cwd ./app --deadline-ms 8000 --out /tmp/app -- bun run dev";
 
 const ANSI_HELP: &str = "\
@@ -62,7 +71,9 @@ Examples:
 const LAUNCH_HELP: &str = "\
 Launch starts one background PTY session and returns once its local control socket is available.
 The application stays alive until `cellshot close NAME`, so later commands interact with the
-same screen and application state. Persistent sessions currently require macOS or Linux.
+same screen and application state. Persistent sessions currently require macOS or Linux. Session
+sockets are local control endpoints protected for the current user; recordings contain terminal
+output and any input sent through cellshot, so treat them as sensitive artifacts.
 
 Example:
   cellshot launch --name demo --host opentui --cols 112 --rows 34 -- opencode
@@ -75,10 +86,26 @@ Example:
 const SEND_HELP: &str = "\
 Send one ordered input burst to a live session. Key names are `ctrl-p`, `enter`, `escape`, `up`,
 `down`, `left`, `right`, and `tab`; text uses `text:<value>`.
+Add `--pace-ms 35` when producing a human-readable recording so typed text appears character by
+character in the terminal instead of as one immediate paste.
 
 Examples:
   cellshot send demo ctrl-p text:model enter
-  cellshot send demo text:/connect enter";
+  cellshot send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
+
+const VIDEO_HELP: &str = "\
+Replay a recording produced by `launch --record` into a video artifact. Output is sampled at --fps and
+begins at the first visible terminal content while preserving real timing afterward. Pass
+--from-launch to include blank startup/negotiation frames or --max-idle-ms when you explicitly
+want to shorten long quiet gaps for a condensed edit. The source `.cellshot` file retains observed
+timing, terminal bytes, client input, and automatic host input until the session is closed.
+Video export requires `ffmpeg` to be installed.
+
+Example:
+  cellshot launch --name demo --record captures/demo.cellshot -- opencode
+  cellshot send demo text:/connect enter
+  cellshot close demo
+  cellshot video captures/demo.cellshot --out captures/demo.mp4";
 
 #[derive(Parser)]
 #[command(
@@ -110,6 +137,9 @@ enum Command {
     Snapshot(SnapshotArgs),
     /// Terminate a named session.
     Close(SessionArgs),
+    /// Export a video from a recorded persistent session.
+    #[command(after_help = VIDEO_HELP)]
+    Video(VideoArgs),
     /// Render ANSI/VT bytes from a file or stdin without spawning a process.
     #[command(long_about = "Render ANSI/VT bytes from a file or stdin without spawning a process.", after_help = ANSI_HELP)]
     Ansi(AnsiArgs),
@@ -167,6 +197,12 @@ struct OutputArgs {
 struct CaptureArgs {
     #[command(flatten)]
     output: OutputArgs,
+    /// Capture backend to use for the command.
+    #[arg(long, value_enum, default_value = "pty")]
+    mode: CaptureMode,
+    /// Color environment policy for the captured command.
+    #[arg(long, value_enum, default_value = "auto")]
+    color: ColorMode,
     /// Capture after this many milliseconds without PTY output.
     #[arg(long, default_value_t = 250)]
     settle_ms: u64,
@@ -219,6 +255,9 @@ struct LaunchArgs {
     /// Working directory for the terminal command.
     #[arg(long)]
     cwd: Option<PathBuf>,
+    /// Write timestamped terminal output and all sent input to this private recording file.
+    #[arg(long)]
+    record: Option<PathBuf>,
     /// Terminal-host compatibility response profile.
     #[arg(long, value_enum)]
     host: Option<HostProfile>,
@@ -242,6 +281,9 @@ struct WaitArgs {
 struct SendArgs {
     /// Name of a running session.
     name: String,
+    /// Delay between input atoms; text is split into characters when set.
+    #[arg(long, default_value_t = 0)]
+    pace_ms: u64,
     /// Ordered input: key name or `text:<value>`.
     #[arg(value_name = "INPUT", num_args = 1..)]
     input: Vec<String>,
@@ -274,6 +316,8 @@ struct ServeArgs {
     #[arg(long)]
     cwd: Option<PathBuf>,
     #[arg(long)]
+    record: Option<PathBuf>,
+    #[arg(long)]
     opentui_host: bool,
     #[arg(long)]
     cols: u16,
@@ -287,6 +331,48 @@ struct ServeArgs {
     max_bytes: usize,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct VideoArgs {
+    /// Recording created by `launch --record`.
+    input: PathBuf,
+    /// Override the recorded terminal cell width in rendered pixels.
+    #[arg(long)]
+    cell_width: Option<u16>,
+    /// Override the recorded terminal cell height in rendered pixels.
+    #[arg(long)]
+    cell_height: Option<u16>,
+    /// Outer padding around the rendered terminal in pixels.
+    #[arg(long, default_value_t = 18.0)]
+    padding: f32,
+    /// Font family used in video output.
+    #[arg(
+        long,
+        default_value = "JetBrains Mono, SFMono-Regular, Menlo, monospace"
+    )]
+    font_family: String,
+    /// Scale video frames for sharp HiDPI viewing.
+    #[arg(long, default_value_t = 2.0)]
+    pixel_ratio: f32,
+    /// Output video file path.
+    #[arg(short, long, default_value = "capture.mp4")]
+    out: PathBuf,
+    /// Hide the terminal cursor in rendered output.
+    #[arg(long)]
+    hide_cursor: bool,
+    /// Maximum sampled frames per second.
+    #[arg(long, default_value_t = 20)]
+    fps: u32,
+    /// Optionally collapse longer gaps between changed screens to this duration.
+    #[arg(long)]
+    max_idle_ms: Option<u64>,
+    /// Hold the final frame for this duration.
+    #[arg(long, default_value_t = 1000)]
+    tail_ms: u64,
+    /// Include leading contentless startup/terminal negotiation frames.
+    #[arg(long)]
+    from_launch: bool,
 }
 
 #[derive(Args)]
@@ -307,9 +393,44 @@ enum HostProfile {
     Opentui,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CaptureMode {
+    /// Run the command inside a pseudo-terminal.
+    Pty,
+    /// Run the command with stdout/stderr pipes and render plain output as terminal text.
+    Pipe,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ColorMode {
+    /// Preserve the current process color environment.
+    Auto,
+    /// Remove NO_COLOR and set common force-color environment variables.
+    Always,
+    /// Set common no-color environment variables.
+    Never,
+}
+
+impl From<ColorMode> for capture::ColorMode {
+    fn from(value: ColorMode) -> Self {
+        match value {
+            ColorMode::Auto => capture::ColorMode::Auto,
+            ColorMode::Always => capture::ColorMode::Always,
+            ColorMode::Never => capture::ColorMode::Never,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Capture(args) => {
+            validate_terminal_size(args.output.cols, args.output.rows)?;
+            if matches!(args.mode, CaptureMode::Pipe) && !args.send.is_empty() {
+                bail!("--send is only supported with --mode pty");
+            }
+            if matches!(args.mode, CaptureMode::Pipe) && args.host.is_some() {
+                bail!("--host is only supported with --mode pty");
+            }
             let options = capture::Options {
                 cols: args.output.cols,
                 rows: args.output.rows,
@@ -322,15 +443,23 @@ fn main() -> Result<()> {
                 wait_for: args.wait_for,
                 max_bytes: args.max_bytes,
                 opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+                color: args.color.into(),
             };
-            let captured = capture::command(&args.command, args.cwd.as_deref(), &options)?;
+            let captured = match args.mode {
+                CaptureMode::Pty => capture::command(&args.command, args.cwd.as_deref(), &options),
+                CaptureMode::Pipe => {
+                    capture::pipe_command(&args.command, args.cwd.as_deref(), &options)
+                }
+            }?;
             write_outputs(&captured, &args.output.render)?;
         }
         Command::Launch(args) => {
+            validate_terminal_size(args.cols, args.rows)?;
             session::launch(
                 &args.name,
                 &args.command,
                 args.cwd.as_deref(),
+                args.record.as_deref(),
                 &capture::Options {
                     cols: args.cols,
                     rows: args.rows,
@@ -343,6 +472,7 @@ fn main() -> Result<()> {
                     wait_for: None,
                     max_bytes: args.max_bytes,
                     opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+                    color: capture::ColorMode::Auto,
                 },
             )?;
             println!("{}", args.name);
@@ -355,7 +485,11 @@ fn main() -> Result<()> {
             )?;
         }
         Command::Send(args) => {
-            session::send(&args.name, capture_input(&args.input)?)?;
+            session::send(
+                &args.name,
+                session_input(&args.input, args.pace_ms > 0)?,
+                Duration::from_millis(args.pace_ms),
+            )?;
         }
         Command::Snapshot(args) => {
             let captured = session::snapshot(
@@ -368,7 +502,26 @@ fn main() -> Result<()> {
         Command::Close(args) => {
             session::close(&args.name)?;
         }
+        Command::Video(args) => {
+            recording::video(
+                &args.input,
+                &recording::VideoOptions {
+                    out: args.out,
+                    cell_width: args.cell_width,
+                    cell_height: args.cell_height,
+                    padding: args.padding,
+                    font_family: args.font_family,
+                    pixel_ratio: args.pixel_ratio,
+                    hide_cursor: args.hide_cursor,
+                    fps: args.fps,
+                    max_idle: args.max_idle_ms.map(Duration::from_millis),
+                    tail: Duration::from_millis(args.tail_ms),
+                    from_launch: args.from_launch,
+                },
+            )?;
+        }
         Command::Ansi(args) => {
+            validate_terminal_size(args.output.cols, args.output.rows)?;
             let mut input = Vec::new();
             let limit = args.max_bytes.saturating_add(1) as u64;
             if let Some(path) = args.input.as_ref() {
@@ -395,6 +548,7 @@ fn main() -> Result<()> {
                 args.socket,
                 args.command,
                 args.cwd,
+                args.record,
                 capture::Options {
                     cols: args.cols,
                     rows: args.rows,
@@ -407,6 +561,7 @@ fn main() -> Result<()> {
                     wait_for: None,
                     max_bytes: args.max_bytes,
                     opentui_host: args.opentui_host,
+                    color: capture::ColorMode::Auto,
                 },
             )?;
         }
@@ -436,6 +591,28 @@ fn capture_input(events: &[String]) -> Result<Vec<u8>> {
         });
     }
     Ok(input)
+}
+
+fn session_input(events: &[String], paced: bool) -> Result<Vec<Vec<u8>>> {
+    if !paced {
+        return Ok(vec![capture_input(events)?]);
+    }
+    let mut input = Vec::new();
+    for event in events {
+        if let Some(text) = event.strip_prefix("text:") {
+            input.extend(text.chars().map(|char| char.to_string().into_bytes()));
+            continue;
+        }
+        input.push(capture_input(std::slice::from_ref(event))?);
+    }
+    Ok(input)
+}
+
+fn validate_terminal_size(cols: u16, rows: u16) -> Result<()> {
+    if cols == 0 || rows == 0 {
+        bail!("terminal dimensions must be greater than zero");
+    }
+    Ok(())
 }
 
 fn write_outputs(captured: &capture::Captured, args: &RenderArgs) -> Result<()> {
@@ -525,5 +702,19 @@ mod tests {
             panic!("expected capture command");
         };
         assert_eq!(args.send, ["ctrl-p", "text:model", "enter"]);
+    }
+
+    #[test]
+    fn rejects_zero_terminal_dimensions() {
+        assert!(validate_terminal_size(0, 24).is_err());
+        assert!(validate_terminal_size(80, 0).is_err());
+    }
+
+    #[test]
+    fn paced_session_input_splits_text_without_splitting_keys() {
+        assert_eq!(
+            session_input(&["text:hi".to_owned(), "enter".to_owned()], true).unwrap(),
+            vec![b"h".to_vec(), b"i".to_vec(), b"\r".to_vec()]
+        );
     }
 }

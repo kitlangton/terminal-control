@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,12 +28,20 @@ pub struct Options {
     pub wait_for: Option<String>,
     pub max_bytes: usize,
     pub opentui_host: bool,
+    pub color: ColorMode,
 }
 
 #[derive(Deserialize, Serialize)]
 pub struct Captured {
     pub frame: Frame,
     pub ansi: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 pub fn ansi(bytes: Vec<u8>, rows: u16, cols: u16, max_bytes: usize) -> Result<Captured> {
@@ -61,8 +70,7 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
         .context("open pseudo-terminal")?;
     let mut builder = CommandBuilder::new(&command[0]);
     builder.args(&command[1..]);
-    builder.env("TERM", "xterm-truecolor");
-    builder.env("COLORTERM", "truecolor");
+    configure_pty_environment(&mut builder, options.color);
     if let Some(cwd) = cwd {
         builder.cwd(cwd);
     }
@@ -96,15 +104,18 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
         let mut ansi = Vec::new();
         let mut host = Host::new(writer, options);
         let started = Instant::now();
-        let deadline = started + options.deadline;
+        let mut clock = Clock {
+            started,
+            deadline: started + options.deadline,
+            last_output: None,
+        };
         let closed = consume_until_ready(
             &receive,
             &mut terminal,
             &mut ansi,
             &mut host,
             options,
-            started,
-            deadline,
+            &mut clock,
         )?;
         if let Some(pattern) = options.wait_for.as_deref()
             && !terminal.screen().contents().contains(pattern)
@@ -113,7 +124,9 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
                 "visible terminal did not include --wait-for {pattern:?} before command ended or deadline elapsed"
             );
         }
-        if !closed && Instant::now() < deadline && !options.input.is_empty() {
+        if !closed && Instant::now() < clock.deadline && !options.input.is_empty() {
+            // Once input is sent, the pre-input idle frame is no longer the capture target.
+            clock.last_output = None;
             host.send(&options.input)?;
             consume_until_settled(
                 &receive,
@@ -121,7 +134,7 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
                 &mut ansi,
                 &mut host,
                 options,
-                deadline,
+                &mut clock,
             )?;
         }
         Ok(Captured {
@@ -149,6 +162,155 @@ pub fn command(command: &[String], cwd: Option<&Path>, options: &Options) -> Res
     result
 }
 
+pub fn pipe_command(command: &[String], cwd: Option<&Path>, options: &Options) -> Result<Captured> {
+    if command.is_empty() {
+        bail!("provide a command after --");
+    }
+    let mut builder = ProcessCommand::new(&command[0]);
+    builder
+        .args(&command[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_environment(&mut builder, options.color);
+    if let Some(cwd) = cwd {
+        builder.current_dir(cwd);
+    }
+    let mut child = builder
+        .spawn()
+        .with_context(|| format!("spawn command {:?}", command[0]))?;
+    let stdout = child.stdout.take().context("open command stdout")?;
+    let stderr = child.stderr.take().context("open command stderr")?;
+    let (send, receive) = mpsc::sync_channel::<Option<Vec<u8>>>(32);
+    spawn_pipe_reader(stdout, send.clone());
+    spawn_pipe_reader(stderr, send);
+
+    let mut terminal = terminal(options.rows, options.cols);
+    let mut ansi = Vec::new();
+    let mut normalizer = LinefeedNormalizer::default();
+    let started = Instant::now();
+    let deadline = started + options.deadline;
+    let mut open_streams = 2_usize;
+    let mut exited = false;
+    while open_streams > 0 || !exited {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(20));
+        if timeout.is_zero() {
+            break;
+        }
+        match receive.recv_timeout(timeout) {
+            Ok(Some(bytes)) => {
+                let bytes = normalizer.normalize(&bytes);
+                retain(&mut ansi, &bytes, options.max_bytes)?;
+                terminal.process(&bytes);
+            }
+            Ok(None) => open_streams = open_streams.saturating_sub(1),
+            Err(RecvTimeoutError::Disconnected) => open_streams = 0,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if !exited {
+            exited = child.try_wait().context("wait for command")?.is_some();
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    if let Some(pattern) = options.wait_for.as_deref()
+        && !terminal.screen().contents().contains(pattern)
+    {
+        bail!(
+            "visible terminal did not include --wait-for {pattern:?} before command ended or deadline elapsed"
+        );
+    }
+    Ok(Captured {
+        frame: from_screen(terminal.screen()),
+        ansi,
+    })
+}
+
+fn spawn_pipe_reader(
+    mut reader: impl Read + Send + 'static,
+    send: mpsc::SyncSender<Option<Vec<u8>>>,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(len) => {
+                    if send.send(Some(buffer[..len].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(None);
+    });
+}
+
+#[derive(Default)]
+struct LinefeedNormalizer {
+    previous_was_cr: bool,
+}
+
+impl LinefeedNormalizer {
+    fn normalize(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            if byte == b'\n' && !self.previous_was_cr {
+                normalized.push(b'\r');
+            }
+            normalized.push(byte);
+            self.previous_was_cr = byte == b'\r';
+        }
+        normalized
+    }
+}
+
+fn configure_pty_environment(builder: &mut CommandBuilder, color: ColorMode) {
+    builder.env("TERM", "xterm-truecolor");
+    builder.env("COLORTERM", "truecolor");
+    match color {
+        ColorMode::Auto => {}
+        ColorMode::Always => {
+            builder.env_remove("NO_COLOR");
+            builder.env("FORCE_COLOR", "1");
+            builder.env("CLICOLOR", "1");
+            builder.env("CLICOLOR_FORCE", "1");
+        }
+        ColorMode::Never => {
+            builder.env("NO_COLOR", "1");
+            builder.env("FORCE_COLOR", "0");
+            builder.env("CLICOLOR", "0");
+            builder.env("CLICOLOR_FORCE", "0");
+        }
+    }
+}
+
+fn configure_process_environment(builder: &mut ProcessCommand, color: ColorMode) {
+    builder.env("TERM", "xterm-truecolor");
+    builder.env("COLORTERM", "truecolor");
+    match color {
+        ColorMode::Auto => {}
+        ColorMode::Always => {
+            builder.env_remove("NO_COLOR");
+            builder.env("FORCE_COLOR", "1");
+            builder.env("CLICOLOR", "1");
+            builder.env("CLICOLOR_FORCE", "1");
+        }
+        ColorMode::Never => {
+            builder.env("NO_COLOR", "1");
+            builder.env("FORCE_COLOR", "0");
+            builder.env("CLICOLOR", "0");
+            builder.env("CLICOLOR_FORCE", "0");
+        }
+    }
+}
+
 pub(crate) fn terminal(rows: u16, cols: u16) -> Parser {
     Parser::new(rows, cols, 0)
 }
@@ -159,35 +321,35 @@ fn consume_until_ready(
     ansi: &mut Vec<u8>,
     host: &mut Host,
     options: &Options,
-    started: Instant,
-    deadline: Instant,
+    clock: &mut Clock,
 ) -> Result<bool> {
     let mut closed = false;
-    let delay_end = (started + options.initial_delay).min(deadline);
+    let delay_end = (clock.started + options.initial_delay).min(clock.deadline);
     while !closed && Instant::now() < delay_end {
         closed = matches!(
-            receive_chunk(receive, terminal, ansi, host, options.max_bytes, deadline)?,
+            receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)?,
             Chunk::Closed
         );
     }
     if let Some(pattern) = &options.wait_for {
         while !closed
-            && Instant::now() < deadline
+            && Instant::now() < clock.deadline
             && !terminal.screen().contents().contains(pattern)
         {
             closed = matches!(
-                receive_chunk(receive, terminal, ansi, host, options.max_bytes, deadline)?,
+                receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)?,
                 Chunk::Closed
             );
         }
     }
-    if closed || Instant::now() >= deadline {
+    if closed || Instant::now() >= clock.deadline {
         return Ok(closed);
     }
-    if options.wait_for.is_some() && !options.input.is_empty() {
+    if !options.input.is_empty() && (options.wait_for.is_some() || !options.initial_delay.is_zero())
+    {
         return Ok(false);
     }
-    consume_until_settled(receive, terminal, ansi, host, options, deadline)
+    consume_until_settled(receive, terminal, ansi, host, options, clock)
 }
 
 enum Chunk {
@@ -196,15 +358,22 @@ enum Chunk {
     Closed,
 }
 
+struct Clock {
+    started: Instant,
+    deadline: Instant,
+    last_output: Option<Instant>,
+}
+
 fn receive_chunk(
     receive: &mpsc::Receiver<Option<Vec<u8>>>,
     terminal: &mut Parser,
     ansi: &mut Vec<u8>,
     host: &mut Host,
     max_bytes: usize,
-    deadline: Instant,
+    clock: &mut Clock,
 ) -> Result<Chunk> {
-    let timeout = deadline
+    let timeout = clock
+        .deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_millis(20));
     if timeout.is_zero() {
@@ -215,6 +384,7 @@ fn receive_chunk(
             host.respond(&bytes)?;
             retain(ansi, &bytes, max_bytes)?;
             terminal.process(&bytes);
+            clock.last_output = Some(Instant::now());
             Ok(Chunk::Output)
         }
         Ok(None) | Err(RecvTimeoutError::Disconnected) => Ok(Chunk::Closed),
@@ -228,24 +398,22 @@ fn consume_until_settled(
     ansi: &mut Vec<u8>,
     host: &mut Host,
     options: &Options,
-    deadline: Instant,
+    clock: &mut Clock,
 ) -> Result<bool> {
-    let mut last_output = Instant::now();
-    let mut has_output = false;
     loop {
-        match receive_chunk(receive, terminal, ansi, host, options.max_bytes, deadline)? {
-            Chunk::Output => {
-                has_output = true;
-                last_output = Instant::now();
-            }
+        match receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)? {
+            Chunk::Output => {}
             Chunk::Closed => return Ok(true),
             Chunk::Timeout => {
-                if Instant::now() >= deadline {
+                if Instant::now() >= clock.deadline {
                     return Ok(false);
                 }
             }
         }
-        if has_output && last_output.elapsed() >= options.settle {
+        if clock
+            .last_output
+            .is_some_and(|last| last.elapsed() >= options.settle)
+        {
             return Ok(false);
         }
     }
@@ -291,10 +459,11 @@ impl Host {
         self.writer.flush().context("flush terminal input")
     }
 
-    pub(crate) fn respond(&mut self, output: &[u8]) -> Result<()> {
+    pub(crate) fn respond(&mut self, output: &[u8]) -> Result<Vec<u8>> {
         if !self.enabled {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut response = Vec::new();
         self.probe.extend_from_slice(output);
         if !self.opentui_replied
             && self
@@ -302,9 +471,8 @@ impl Host {
                 .windows(OPENTUI_QUERY.len())
                 .any(|window| window == OPENTUI_QUERY)
         {
-            self.writer
-                .write_all(
-                    format!(
+            response.extend_from_slice(
+                format!(
                         "\x1b]10;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1bP>|cellshot {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
                         DEFAULT_FOREGROUND.r,
                         DEFAULT_FOREGROUND.r,
@@ -321,10 +489,9 @@ impl Host {
                         env!("CARGO_PKG_VERSION"),
                         self.pixel_height,
                         self.pixel_width,
-                    )
-                    .as_bytes(),
                 )
-                .context("write OpenTUI host response")?;
+                .as_bytes(),
+            );
             self.opentui_replied = true;
         }
         if !self.palette_replied
@@ -333,9 +500,7 @@ impl Host {
                 .windows(PALETTE_QUERY.len())
                 .any(|window| window == PALETTE_QUERY)
         {
-            self.writer
-                .write_all(b"\x1b]4;0;rgb:0000/0000/0000\x1b\\")
-                .context("write OpenTUI palette response")?;
+            response.extend_from_slice(b"\x1b]4;0;rgb:0000/0000/0000\x1b\\");
             self.palette_replied = true;
         }
         if !self.kitty_replied
@@ -344,16 +509,19 @@ impl Host {
                 .windows(KITTY_QUERY.len())
                 .any(|window| window == KITTY_QUERY)
         {
-            self.writer
-                .write_all(b"\x1b_Gi=31337;OK\x1b\\")
-                .context("write OpenTUI graphics response")?;
+            response.extend_from_slice(b"\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\");
             self.kitty_replied = true;
         }
-        self.writer.flush().context("flush OpenTUI host response")?;
+        if !response.is_empty() {
+            self.writer
+                .write_all(&response)
+                .context("write OpenTUI host response")?;
+            self.writer.flush().context("flush OpenTUI host response")?;
+        }
         if self.probe.len() > 64 {
             self.probe.drain(..self.probe.len() - 64);
         }
-        Ok(())
+        Ok(response)
     }
 }
 
@@ -376,6 +544,45 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_plain_line_feeds_for_pipe_output() {
+        let mut normalizer = LinefeedNormalizer::default();
+        assert_eq!(normalizer.normalize(b"one\n"), b"one\r\n");
+        assert_eq!(normalizer.normalize(b"two\r"), b"two\r");
+        assert_eq!(normalizer.normalize(b"\nthree"), b"\nthree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_command_captures_non_tty_output() {
+        let captured = pipe_command(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'one\\ntwo\\n'".to_owned(),
+            ],
+            None,
+            &Options {
+                cols: 20,
+                rows: 4,
+                cell_width: 9,
+                cell_height: 18,
+                settle: Duration::ZERO,
+                deadline: Duration::from_secs(2),
+                input: Vec::new(),
+                initial_delay: Duration::ZERO,
+                wait_for: None,
+                max_bytes: 1024,
+                opentui_host: false,
+                color: ColorMode::Auto,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(captured.frame.text(), "one\ntwo");
+        assert!(captured.ansi.windows(2).any(|window| window == b"\r\n"));
+    }
+
+    #[test]
     fn responds_to_split_opentui_query_with_requested_geometry() {
         let result = Arc::new(Mutex::new(Vec::new()));
         let mut host = Host::new(
@@ -392,6 +599,7 @@ mod tests {
                 wait_for: None,
                 max_bytes: 1,
                 opentui_host: true,
+                color: ColorMode::Auto,
             },
         );
 
@@ -404,6 +612,6 @@ mod tests {
         let output = String::from_utf8(result.lock().unwrap().clone()).unwrap();
         assert!(output.contains("\x1b[4;480;900t"));
         assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
-        assert!(output.contains("\x1b_Gi=31337;OK\x1b\\"));
+        assert!(output.contains("\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\"));
     }
 }
