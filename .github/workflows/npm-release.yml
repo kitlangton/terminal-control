@@ -1,0 +1,111 @@
+name: npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the assembled npm packages
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native ${{ matrix.package }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            package: darwin-arm64
+          - runner: macos-15-intel
+            package: darwin-x64
+          - runner: ubuntu-24.04-arm
+            package: linux-arm64-gnu
+          - runner: ubuntu-latest
+            package: linux-x64-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build --release
+      - run: node scripts/native-packages.mjs "${{ matrix.package }}" "$PWD/target/release/cellshot" "$PWD/npm-artifacts"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.package }}
+          path: npm-artifacts/*.tgz
+
+  client:
+    name: TypeScript client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd packages/test typecheck
+      - run: mkdir -p npm-artifacts && npm pack ./packages/test --pack-destination npm-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-test
+          path: npm-artifacts/*.tgz
+
+  validate:
+    name: Validate publishable install
+    needs: [native, client]
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            package: darwin-arm64
+          - runner: macos-15-intel
+            package: darwin-x64
+          - runner: ubuntu-24.04-arm
+            package: linux-arm64-gnu
+          - runner: ubuntu-latest
+            package: linux-x64-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm-artifacts
+          merge-multiple: true
+      - run: node scripts/publish-npm-tarballs.mjs npm-artifacts --check
+      - run: node scripts/validate-npm-packages.mjs --tarballs npm-artifacts "${{ matrix.package }}"
+
+  publish:
+    name: Publish npm packages
+    if: ${{ inputs.publish }}
+    needs: [native, client, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm-artifacts
+          merge-multiple: true
+      - run: node scripts/publish-npm-tarballs.mjs npm-artifacts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

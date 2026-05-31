@@ -1,4 +1,4 @@
-import { IncompleteCaptureError, Screen, Session } from "./index"
+import { IncompleteCaptureError, Screen, Session } from "./index.js"
 import type {} from "vitest"
 
 type MatcherResult = {

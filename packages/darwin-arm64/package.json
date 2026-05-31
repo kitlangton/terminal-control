@@ -1,0 +1,16 @@
+{
+  "name": "@cellshot/darwin-arm64",
+  "version": "0.1.0",
+  "description": "Native cellshot binary for macOS arm64",
+  "license": "MIT",
+  "repository": "https://github.com/kitlangton/cellshot",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/cellshot", "README.md", "LICENSE"],
+  "bin": {
+    "cellshot": "bin/cellshot"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

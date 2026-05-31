@@ -1,0 +1,17 @@
+{
+  "name": "@cellshot/linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "Native cellshot binary for Linux x64 GNU",
+  "license": "MIT",
+  "repository": "https://github.com/kitlangton/cellshot",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "files": ["bin/cellshot", "README.md", "LICENSE"],
+  "bin": {
+    "cellshot": "bin/cellshot"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

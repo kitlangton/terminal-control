@@ -1,0 +1,19 @@
+{
+  "name": "cellshot-workspace",
+  "private": true,
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:npm": "bun run --cwd packages/test build",
+    "test:npm": "bun run --cwd packages/test typecheck && bun run --cwd packages/test test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "validate:npm": "node scripts/validate-npm-packages.mjs",
+    "release-packages": "node scripts/publish-npm-tarballs.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.7"
+  }
+}

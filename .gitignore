@@ -1,6 +1,10 @@
 /target
+/node_modules
 /packages/test/node_modules
+/packages/*/bin/cellshot
+/packages/test/dist
 /.cellshot-artifacts
+/npm-artifacts
 /captures
 /docs/screenshots/*.ansi
 /docs/screenshots/*.json

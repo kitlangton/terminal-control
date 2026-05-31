@@ -209,13 +209,18 @@ A driver `shot` response contains a structured visible frame, derived `text`, an
 
 ## TypeScript Client
 
-The private experimental package under `packages/test` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from retained history and the exact ANSI/VT transcript. Until platform-native npm packages are published, provide a built `cellshot` through `binaryPath` or `CELLSHOT_BINARY`; the resolver is already structured to load future optional native packages automatically.
+`@cellshot/test` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from retained history and the exact ANSI/VT transcript. Its npm distribution includes an optional native package for macOS or GNU/Linux on arm64 or x64, so consumers do not need a Rust toolchain or separate `cellshot` installation.
+
+After the initial npm publication:
+
+```bash
+bun add -d @cellshot/test vitest
+```
 
 ```ts
 import { createCellshot } from "@cellshot/test"
 
 await using cellshot = await createCellshot({
-  binaryPath: "./target/release/cellshot",
   artifacts: {
     directory: ".cellshot-artifacts",
     onFailure: true,
@@ -247,6 +252,8 @@ const exit = await session.waitForExit({ timeoutMs: 5_000 })
 expect(exit).toMatchObject({ reason: "exited", exit: { code: 0 } })
 ```
 
+When working directly from this repository before installing the npm artifacts, pass `binaryPath: "./target/release/cellshot"` or set `CELLSHOT_BINARY`.
+
 `session.screen.text()` and `session.screen.frame()` wait for a settled capture and reject deadline or output-closed fallback by default. A test that intentionally needs an intermediate frame can request it explicitly:
 
 ```ts
@@ -270,7 +277,7 @@ await expect(session).toHaveScreenText("Ready\n\nChoose an option")
 await expect(session.screen.text()).resolves.toMatchInlineSnapshot()
 ```
 
-`session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `history.txt`, and `metadata.json`. `transcript.ansi` and `recording.cellshot` are opt-in because terminal streams and typed input may contain secrets. Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
+`session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `history.txt`, and `metadata.json`. Environment variable values are redacted in metadata. `transcript.ansi` and `recording.cellshot` are opt-in because terminal streams and typed input may contain secrets. Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
 
 ```ts
 await session.withArtifactsOnFailure("settings-snapshot", async () => {
@@ -284,6 +291,12 @@ Enable a recording with `record: true` or `record: "on-failure"`; a test may exp
 await session.resize({ cols: 120, rows: 40 })
 await session.saveRecording("artifacts/navigation.cellshot")
 ```
+
+### npm Release
+
+The npm workspace publishes `@cellshot/test` with fixed-version platform packages: `@cellshot/darwin-arm64`, `@cellshot/darwin-x64`, `@cellshot/linux-arm64-gnu`, and `@cellshot/linux-x64-gnu`. The client is compiled to ESM JavaScript with declarations; each native package receives the release Rust executable during the `npm release` workflow.
+
+The initial unpublished npm packages are prepared at `0.1.0`. For subsequent user-facing npm changes, create a Changeset with `bunx changeset`, commit the generated release metadata, and apply version changes before running the workflow. Run the workflow with `publish: false` to assemble packages only, or `publish: true` to publish assembled tarballs after its clean Bun and Node/Vitest consumer validation passes.
 
 ## Notes
 

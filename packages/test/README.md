@@ -1,18 +1,22 @@
 # @cellshot/test
 
-Private experimental TypeScript test client for `cellshot driver`.
+Typed terminal application testing client for `cellshot driver`, with stable screen snapshots, keyboard interaction, recordings, and opt-in failure evidence.
 
-Use a locally built binary while this package remains private:
+Install the package with Vitest after the initial npm publication:
+
+```bash
+bun add -d @cellshot/test vitest
+```
+
+The matching native `cellshot` binary is installed automatically on macOS or GNU/Linux on arm64 or x64:
 
 ```ts
 import { createCellshot } from "@cellshot/test"
 
-await using cellshot = await createCellshot({
-  binaryPath: "../../target/release/cellshot",
-})
+await using cellshot = await createCellshot()
 ```
 
-The runtime resolves an explicit `binaryPath` first, then `CELLSHOT_BINARY`, then an optional native package for the current platform. The intended publish layout is `@cellshot/test` plus `@cellshot/darwin-arm64`, `@cellshot/darwin-x64`, `@cellshot/linux-arm64-gnu`, and `@cellshot/linux-x64-gnu`, each exposing `bin/cellshot`. Those native packages are intentionally not published or declared as dependencies until clean-consumer package validation is in place.
+For development or custom native builds, the runtime resolves an explicit `binaryPath` first, then `CELLSHOT_BINARY`, before the installed native package.
 
 Visible screen text and frames are stable snapshot surfaces:
 

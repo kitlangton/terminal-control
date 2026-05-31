@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -363,7 +364,7 @@ export class Cellshot implements AsyncDisposable {
   async launch(options: LaunchOptions): Promise<Session> {
     const sessionId = `session-${this.nextSessionId++}`
     const temporaryRecording = options.record === true || options.record === "on-failure"
-      ? join(tmpdir(), `cellshot-${process.pid}-${sessionId}.cellshot`)
+      ? join(tmpdir(), `cellshot-${process.pid}-${randomUUID()}.cellshot`)
       : undefined
     const record = temporaryRecording ?? options.record
     await this.request("launch", {
@@ -526,7 +527,7 @@ export class Session implements AsyncDisposable {
       writeFile(manifest.metadata, JSON.stringify({
         sessionId: this.id,
         captureReason: capture.reason,
-        launch: this.launchOptions,
+        launch: artifactLaunchOptions(this.launchOptions),
         status,
       }, null, 2)),
     ])
@@ -702,4 +703,12 @@ function isControlKey(key: Key): key is `Control+${Uppercase<ControlLetter>}` {
 function artifactName(name: string): string {
   const safe = name.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "")
   return safe || "failure"
+}
+
+function artifactLaunchOptions(options?: LaunchOptions): LaunchOptions | undefined {
+  if (!options?.env) return options
+  return {
+    ...options,
+    env: Object.fromEntries(Object.keys(options.env).map((key) => [key, "[redacted]"])),
+  }
 }
