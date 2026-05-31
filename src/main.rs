@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -8,82 +8,58 @@ use cellshot::{driver, recording, render, session, shot as shot_engine};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const HELP: &str = "\
-cellshot exports terminal shots for TUI inspection and agent workflows. A shot can observe a
-command, piped command output, an ANSI/VT byte stream, or a running session, then write selected
-visual and inspectable formats from the visible terminal frame.";
+cellshot controls and captures terminal applications for agents and tests. Start a named live
+application, read its visible screen with `show`, or retain selected artifacts with `save`.";
 
 const ROOT_EXAMPLES: &str = "\
 Examples:
-  cellshot shot --out captures/app -- my-terminal-app
-  cellshot shot --cols 100 --rows 32 --wait-for 'Commands' -s ctrl-p --out captures/menu -- my-terminal-app
-  cellshot shot --pipe --format png --format txt --out captures/log -- my-log-command
-  cellshot session start demo --host opentui -- opencode
-  cellshot session status demo --json
-  cellshot session wait demo '/connect' && cellshot session send demo text:/connect enter
-  cellshot shot --session demo --format png --out captures/provider
-  cellshot session stop demo
-  printf '\\033[32msuccess\\033[0m\\n' | cellshot shot --input - --out captures/stdin
+  cellshot show -- my-terminal-app
+  cellshot save --format png --out captures/app.png -- my-terminal-app
+  cellshot start demo --host opentui -- opencode
+  cellshot wait demo '/connect' && cellshot send demo text:/connect enter
+  cellshot show demo
+  cellshot save demo --format png --out captures/provider.png
+  cellshot logs demo
+  cellshot restart demo
+  cellshot stop demo";
 
-Use `shot` for one exported frame or `session` for multi-step terminal workflows.";
+const SHOW_HELP: &str = "\
+Show prints a settled visible terminal screen to standard output, as text by default.
 
-const SHOT_HELP: &str = "\
-Shot sources:
-  cellshot shot -- COMMAND...           Run a command in a PTY.
-  cellshot shot --pipe -- COMMAND...    Render piped stdout/stderr; color defaults to always.
-  cellshot shot --input FILE            Render ANSI/VT bytes from FILE, or use - for stdin.
-  cellshot shot --session NAME          Export the current settled frame of a live session.
+Sources:
+  cellshot show NAME                    Read a named live session.
+  cellshot show -- COMMAND...           Run a disposable command in a PTY.
+  cellshot show --pipe -- COMMAND...    Read piped stdout/stderr.
+  cellshot show --input FILE            Read ANSI/VT bytes from FILE, or use - for stdin.
 
-Command flow:
-  1. Start COMMAND inside a PTY, or use --pipe for commands that need ordinary stdout/stderr.
-  2. Optionally wait for --initial-delay-ms and visible --wait-for text.
-  3. If --send input is queued, send the ordered events as one input burst.
-  4. Freeze the visible frame once output is idle for --settle-ms or --deadline-ms expires.
+Use --format json, --format ansi, or --format svg for another stdout-readable representation.
+Use `save` to write files.";
 
-Without --format, shots write PNG, SVG, text, JSON, and ANSI stream artifacts. Repeat --format
-to select exactly the needed outputs, such as `--format png --format txt`. Use `--stdout` with
-one text-based format, or with no format for visible text, when an agent needs direct inspection.
-
-Use --wait-for whenever an interaction must occur only after a UI is mounted. If its text is not
-visible before the command exits or deadline expires, the shot fails rather than exporting the
-wrong screen. Send keys by name and text as `text:<value>`, for example `-s ctrl-p text:model
-enter`. For multiple interaction steps on one live application, use `session start`, `session
-wait`, `session send`, `shot --session`, and `session stop`.
-
-Use `--host opentui` only for OpenTUI applications, including OpenCode, that query terminal
-capabilities before painting their interface. Generic programs do not need a host profile.
-Use `--pipe` for CLIs that skip output when stdout is a TTY; it captures stdout and stderr without
-terminal input and forces color unless overridden with `--color`.
+const SAVE_HELP: &str = "\
+Save freezes a visible terminal screen and writes exactly the requested artifact formats.
 
 Examples:
-  cellshot shot --host opentui --cols 100 --rows 32 --out captures/home -- opencode
-  cellshot shot --host opentui --wait-for '/connect' -s text:/connect enter --out captures/provider -- opencode
-  cellshot shot --pipe --format png --format txt --out captures/log -- my-command
-  cellshot shot --input debug.ansi --format png --out captures/replay
-  cellshot shot --session demo --stdout
-  cellshot shot --session demo --format png --out captures/current";
-
-const SESSION_HELP: &str = "\
-Sessions keep one terminal application alive across interactions and shots. Start a session,
-inspect its status, wait for visible state, send input, resize when needed, export shots with
-`cellshot shot --session NAME`, inspect normal-screen scrollback with `session history`, then stop
-the session when finished.";
+  cellshot save demo --format png --out captures/current.png
+  cellshot save demo --format png --format txt --out captures/current
+  cellshot save --input debug.ansi --format png --out captures/replay.png
+  cellshot save --format png --out captures/startup.png -- my-terminal-app";
 
 const START_HELP: &str = "\
 Start creates one background PTY session and returns once its local control socket is available.
-The application stays alive until `cellshot session stop NAME`, so later commands interact with the
+The application stays alive until `cellshot stop NAME`, so later commands interact with the
 same screen and application state. Persistent sessions currently require macOS or Linux. Session
 sockets are local control endpoints protected for the current user; recordings contain terminal
 output plus client and automatic host input, so treat them as sensitive artifacts.
 
 Example:
-  cellshot session start demo --host opentui --cols 112 --rows 34 -- opencode
-  cellshot session status demo --json
-  cellshot session wait demo '/connect'
-  cellshot session send demo text:/connect enter
-  cellshot session resize demo --cols 132 --rows 38
-  cellshot session wait demo 'Connect a provider'
-  cellshot shot --session demo --out captures/provider
-  cellshot session stop demo";
+  cellshot start demo --host opentui --cols 112 --rows 34 -- opencode
+  cellshot status demo
+  cellshot wait demo '/connect'
+  cellshot send demo text:/connect enter
+  cellshot resize demo --cols 132 --rows 38
+  cellshot show demo
+  cellshot save demo --format png --out captures/provider.png
+  cellshot stop demo";
 
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
@@ -94,10 +70,10 @@ character in the terminal instead of as one immediate paste. Use `--stdin` to se
 from standard input as one burst.
 
 Examples:
-  cellshot session send demo ctrl-p text:model enter
-  cellshot session send demo ctrl-c
-  printf '%s' 'a multiline prompt' | cellshot session send demo --stdin
-  cellshot session send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
+  cellshot send demo ctrl-p text:model enter
+  cellshot send demo ctrl-c
+  printf '%s' 'a multiline prompt' | cellshot send demo --stdin
+  cellshot send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
 
 const VIDEO_HELP: &str = "\
 Replay a recording produced by `session start --record` into a video artifact. Output is sampled at --fps and
@@ -108,16 +84,16 @@ timing, terminal bytes, client input, and automatic host input until the session
 Video export requires `ffmpeg` to be installed.
 
 Example:
-  cellshot session start demo --record captures/demo.cellshot -- opencode
-  cellshot session send demo text:/connect enter
-  cellshot session stop demo
+  cellshot start demo --record captures/demo.cellshot -- opencode
+  cellshot send demo text:/connect enter
+  cellshot stop demo
   cellshot video captures/demo.cellshot --out captures/demo.mp4";
 
 const DRIVER_HELP: &str = "\
 Driver mode serves isolated embedded sessions as newline-delimited JSON over standard input and
 standard output. It is used by the experimental `@cellshot/test` package; standard output
 contains protocol messages only. Driver sessions support isolated child environments, stable
-shots, SVG evidence, recordings, resizing, and explicit exit waiting.
+captures, SVG evidence, recordings, resizing, and explicit exit waiting.
 
 Example:
   cellshot driver";
@@ -126,7 +102,7 @@ Example:
 #[command(
     name = "cellshot",
     version,
-    about = "Export terminal shots and recorded sessions",
+    about = "Control and capture terminal applications",
     long_about = HELP,
     after_help = ROOT_EXAMPLES
 )]
@@ -137,15 +113,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Export one terminal frame from a command, stream, or live session.
-    #[command(after_help = SHOT_HELP)]
-    Shot(ShotArgs),
-    /// Start and control a persistent terminal application.
-    #[command(after_help = SESSION_HELP)]
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
+    /// Print the visible screen of a session, command, or terminal stream.
+    #[command(after_help = SHOW_HELP)]
+    Show(ShowArgs),
+    /// Save selected artifact formats from a session, command, or terminal stream.
+    #[command(after_help = SAVE_HELP)]
+    Save(SaveArgs),
+    /// Start a named persistent terminal application.
+    #[command(after_help = START_HELP)]
+    Start(StartArgs),
+    /// Wait until a named session includes visible text.
+    Wait(WaitArgs),
+    /// Send ordered input to a named session.
+    #[command(after_help = SEND_HELP)]
+    Send(SendArgs),
+    /// Inspect lifecycle state and launch settings of a named session.
+    Status(StatusArgs),
+    /// List named local sessions and their states.
+    List(ListArgs),
+    /// Resize a named live session.
+    Resize(ResizeArgs),
+    /// Print retained readable terminal output or exact ANSI/VT bytes.
+    Logs(LogsArgs),
+    /// Restart a named session, reusing launch settings by default.
+    Restart(RestartArgs),
+    /// Terminate a named session.
+    Stop(SessionArgs),
     /// Export a video from a recorded persistent session.
     #[command(after_help = VIDEO_HELP)]
     Video(VideoArgs),
@@ -176,28 +169,20 @@ struct RenderArgs {
     /// Scale PNG output for sharp HiDPI viewing; SVG output is unchanged.
     #[arg(long, default_value_t = 2.0)]
     pixel_ratio: f32,
-    /// Output path stem; extensions are added automatically.
-    #[arg(short, long, default_value = "shot")]
-    out: PathBuf,
     /// Hide the terminal cursor in rendered output.
     #[arg(long)]
     hide_cursor: bool,
-    /// Output artifact format; repeat to select multiple formats (default: all).
-    #[arg(long = "format", value_enum)]
-    formats: Vec<ShotFormat>,
-    /// Write one text-based format to stdout instead of artifact files (default: txt).
-    #[arg(long)]
-    stdout: bool,
 }
 
 #[derive(Args)]
-struct ShotArgs {
-    #[command(flatten)]
-    render: RenderArgs,
-    /// Terminal width in cells for command or ANSI input shots (default: 80).
+struct SourceArgs {
+    /// Existing named terminal session to read.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Terminal width in cells for command or ANSI input (default: 80).
     #[arg(long)]
     cols: Option<u16>,
-    /// Terminal height in cells for command or ANSI input shots (default: 24).
+    /// Terminal height in cells for command or ANSI input (default: 24).
     #[arg(long)]
     rows: Option<u16>,
     /// Observe command stdout/stderr as pipes instead of launching it in a PTY.
@@ -206,9 +191,6 @@ struct ShotArgs {
     /// Render ANSI/VT bytes from this file; use `-` for stdin.
     #[arg(long, value_name = "FILE")]
     input: Option<PathBuf>,
-    /// Export the current settled frame of this running session.
-    #[arg(long, value_name = "NAME")]
-    session: Option<String>,
     /// Color environment policy for a command source (default: auto for PTY, always for pipe).
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
@@ -237,8 +219,33 @@ struct ShotArgs {
     #[arg(short = 's', long, value_name = "INPUT", num_args = 1..)]
     send: Vec<String>,
     /// Command and arguments to launch, following `--`.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(last = true, required = false, num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct ShowArgs {
+    #[command(flatten)]
+    render: RenderArgs,
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Standard-output representation of the visible screen.
+    #[arg(long, value_enum, default_value = "txt")]
+    format: ShotFormat,
+}
+
+#[derive(Args)]
+struct SaveArgs {
+    #[command(flatten)]
+    render: RenderArgs,
+    #[command(flatten)]
+    source: SourceArgs,
+    /// Output path for one format, or output stem for several formats.
+    #[arg(short, long)]
+    out: PathBuf,
+    /// Artifact format to write; repeat to write several explicit formats.
+    #[arg(long = "format", value_enum, required = true)]
+    formats: Vec<ShotFormat>,
 }
 
 #[derive(Args)]
@@ -277,31 +284,6 @@ struct StartArgs {
     command: Vec<String>,
 }
 
-#[derive(Subcommand)]
-enum SessionCommand {
-    /// Start a named persistent terminal session.
-    #[command(after_help = START_HELP)]
-    Start(StartArgs),
-    /// Wait until a named session includes visible text.
-    Wait(WaitArgs),
-    /// Send ordered input to a named session.
-    #[command(after_help = SEND_HELP)]
-    Send(SendArgs),
-    /// Inspect whether a named session is running or exited.
-    Status(StatusArgs),
-    /// List named local sessions and their states.
-    List(ListArgs),
-    /// Resize a named live session.
-    Resize(ResizeArgs),
-    /// Print retained terminal scrollback or exact ANSI/VT stream bytes.
-    History(HistoryArgs),
-    /// Stop an existing named session if present, then start its replacement.
-    #[command(after_help = START_HELP)]
-    Restart(StartArgs),
-    /// Terminate a named session.
-    Stop(SessionArgs),
-}
-
 #[derive(Args)]
 struct WaitArgs {
     /// Name of a running session.
@@ -309,8 +291,8 @@ struct WaitArgs {
     /// Visible text that must appear in the session screen.
     text: String,
     /// Maximum time to wait before returning an error.
-    #[arg(long, default_value_t = 5000)]
-    timeout_ms: u64,
+    #[arg(long, default_value_t = 5000, value_name = "MS")]
+    timeout: u64,
 }
 
 #[derive(Args)]
@@ -363,12 +345,39 @@ struct ResizeArgs {
 }
 
 #[derive(Args)]
-struct HistoryArgs {
+struct LogsArgs {
     /// Name of a running or inspectable exited session.
     name: String,
-    /// Write exact retained ANSI/VT stream bytes instead of readable normal-screen history.
+    /// Write exact retained ANSI/VT stream bytes instead of readable retained output.
     #[arg(long)]
     ansi: bool,
+}
+
+#[derive(Args)]
+struct RestartArgs {
+    /// Name of a session to restart using its retained launch settings.
+    name: String,
+    #[arg(long)]
+    cols: Option<u16>,
+    #[arg(long)]
+    rows: Option<u16>,
+    #[arg(long)]
+    cell_width: Option<u16>,
+    #[arg(long)]
+    cell_height: Option<u16>,
+    #[arg(long)]
+    max_bytes: Option<usize>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    record: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    color: Option<ColorMode>,
+    #[arg(long, value_enum)]
+    host: Option<HostProfile>,
+    /// Replacement command; when omitted the prior command is reused.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -487,8 +496,34 @@ impl From<ColorMode> for shot_engine::ColorMode {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Shot(args) => shot(args)?,
-        Command::Session { command } => session_command(command)?,
+        Command::Show(args) => show(args)?,
+        Command::Save(args) => save(args)?,
+        Command::Start(args) => {
+            start_session(&args)?;
+            println!("{}", args.name);
+        }
+        Command::Wait(args) => {
+            session::wait(&args.name, args.text, Duration::from_millis(args.timeout))?;
+        }
+        Command::Send(args) => send(args)?,
+        Command::Status(args) => status(args)?,
+        Command::List(args) => list(args)?,
+        Command::Resize(args) => {
+            validate_terminal_size(args.cols, args.rows)?;
+            session::resize(
+                &args.name,
+                args.cols,
+                args.rows,
+                args.cell_width,
+                args.cell_height,
+            )?;
+        }
+        Command::Logs(args) => logs(args)?,
+        Command::Restart(args) => {
+            restart_session(&args)?;
+            println!("{}", args.name);
+        }
+        Command::Stop(args) => session::stop(&args.name)?,
         Command::Video(args) => {
             let out = args.out.clone();
             recording::video(
@@ -540,10 +575,20 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn shot(args: ShotArgs) -> Result<()> {
-    if args.render.stdout {
-        stdout_format(&args.render)?;
+fn show(args: ShowArgs) -> Result<()> {
+    if args.format == ShotFormat::Png {
+        bail!("show does not support PNG output; use save --format png --out PATH");
     }
+    let captured = read_source(&args.source, &args.render)?;
+    write_stdout(&captured, &args.render, args.format)
+}
+
+fn save(args: SaveArgs) -> Result<()> {
+    let captured = read_source(&args.source, &args.render)?;
+    write_outputs(&captured, &args.render, &args.out, &args.formats)
+}
+
+fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Shot> {
     let defaults = shot_engine::Options::default();
     let settle =
         Duration::from_millis(args.settle_ms.unwrap_or(defaults.settle.as_millis() as u64));
@@ -551,13 +596,13 @@ fn shot(args: ShotArgs) -> Result<()> {
         args.deadline_ms
             .unwrap_or(defaults.deadline.as_millis() as u64),
     );
-    if args.input.is_some() && (args.pipe || args.session.is_some() || !args.command.is_empty()) {
-        bail!("--input cannot be combined with --pipe, --session, or a command");
+    if args.input.is_some() && (args.pipe || args.name.is_some() || !args.command.is_empty()) {
+        bail!("--input cannot be combined with --pipe, NAME, or a command");
     }
-    if args.session.is_some() && (args.pipe || !args.command.is_empty()) {
-        bail!("--session cannot be combined with --pipe or a command");
+    if args.name.is_some() && (args.pipe || !args.command.is_empty()) {
+        bail!("NAME cannot be combined with --pipe or a command");
     }
-    if let Some(name) = args.session.as_deref() {
+    if let Some(name) = args.name.as_deref() {
         if args.cols.is_some()
             || args.rows.is_some()
             || args.color.is_some()
@@ -568,12 +613,9 @@ fn shot(args: ShotArgs) -> Result<()> {
             || args.host.is_some()
             || !args.send.is_empty()
         {
-            bail!(
-                "--session shots support rendering, formats, --settle-ms, and --deadline-ms only"
-            );
+            bail!("named-session reads support rendering, --settle-ms, and --deadline-ms only");
         }
-        let captured = session::shot(name, settle, deadline)?;
-        return write_outputs(&captured, &args.render);
+        return session::show(name, settle, deadline);
     }
     let cols = args.cols.unwrap_or(defaults.cols);
     let rows = args.rows.unwrap_or(defaults.rows);
@@ -589,7 +631,7 @@ fn shot(args: ShotArgs) -> Result<()> {
             || args.host.is_some()
             || !args.send.is_empty()
         {
-            bail!("--input shots support dimensions, rendering, formats, and --max-bytes only");
+            bail!("--input reads support dimensions, rendering, and --max-bytes only");
         }
         let mut input = Vec::new();
         let limit = max_bytes.saturating_add(1) as u64;
@@ -605,11 +647,10 @@ fn shot(args: ShotArgs) -> Result<()> {
                 .read_to_end(&mut input)
                 .with_context(|| format!("read {}", path.display()))?;
         }
-        let captured = shot_engine::from_ansi(input, rows, cols, max_bytes)?;
-        return write_outputs(&captured, &args.render);
+        return shot_engine::from_ansi(input, rows, cols, max_bytes);
     }
     if args.command.is_empty() {
-        bail!("provide a command after --, --input FILE, or --session NAME");
+        bail!("provide NAME, a command after --, or --input FILE");
     }
     if args.pipe
         && (!args.send.is_empty()
@@ -617,7 +658,7 @@ fn shot(args: ShotArgs) -> Result<()> {
             || args.initial_delay_ms.is_some()
             || args.settle_ms.is_some())
     {
-        bail!("--pipe shots do not support --send, --host, --initial-delay-ms, or --settle-ms");
+        bail!("--pipe reads do not support --send, --host, --initial-delay-ms, or --settle-ms");
     }
     let color = args.color.unwrap_or(if args.pipe {
         ColorMode::Always
@@ -627,129 +668,112 @@ fn shot(args: ShotArgs) -> Result<()> {
     let options = shot_engine::Options {
         cols,
         rows,
-        cell_width: args.render.cell_width,
-        cell_height: args.render.cell_height,
+        cell_width: render.cell_width,
+        cell_height: render.cell_height,
         settle,
         deadline,
         input: input_bytes(&args.send)?,
         initial_delay: Duration::from_millis(args.initial_delay_ms.unwrap_or(0)),
-        wait_for: args.wait_for,
+        wait_for: args.wait_for.clone(),
         max_bytes,
         opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
         color: color.into(),
         env: Default::default(),
         inherit_env: true,
     };
-    let captured = if args.pipe {
+    if args.pipe {
         shot_engine::from_pipe_command(&args.command, args.cwd.as_deref(), &options)
     } else {
         shot_engine::from_command(&args.command, args.cwd.as_deref(), &options)
-    }?;
-    write_outputs(&captured, &args.render)
+    }
 }
 
-fn session_command(command: SessionCommand) -> Result<()> {
-    match command {
-        SessionCommand::Start(args) => {
-            start_session(&args, false)?;
-            println!("{}", args.name);
+fn send(args: SendArgs) -> Result<()> {
+    if args.stdin && args.pace_ms > 0 {
+        bail!("--stdin cannot be combined with --pace-ms");
+    }
+    let input = if args.stdin {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .context("read session input")?;
+        if bytes.len() > 1024 * 1024 {
+            bail!("session input exceeds 1 MiB");
         }
-        SessionCommand::Wait(args) => {
-            session::wait(
-                &args.name,
-                args.text,
-                Duration::from_millis(args.timeout_ms),
-            )?;
+        vec![bytes]
+    } else {
+        if args.input.is_empty() {
+            bail!("provide INPUT events or --stdin");
         }
-        SessionCommand::Send(args) => {
-            if args.stdin && args.pace_ms > 0 {
-                bail!("--stdin cannot be combined with --pace-ms");
-            }
-            let input = if args.stdin {
-                let mut bytes = Vec::new();
-                io::stdin()
-                    .take(1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .context("read session input")?;
-                if bytes.len() > 1024 * 1024 {
-                    bail!("session input exceeds 1 MiB");
-                }
-                vec![bytes]
-            } else {
-                if args.input.is_empty() {
-                    bail!("provide INPUT events or --stdin");
-                }
-                session_input(&args.input, args.pace_ms > 0)?
-            };
-            session::send(&args.name, input, Duration::from_millis(args.pace_ms))?;
-        }
-        SessionCommand::Status(args) => {
-            let status = session::status(&args.name)?;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
+        session_input(&args.input, args.pace_ms > 0)?
+    };
+    session::send(&args.name, input, Duration::from_millis(args.pace_ms))?;
+    Ok(())
+}
+
+fn status(args: StatusArgs) -> Result<()> {
+    let status = session::status(&args.name)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("{} {}", args.name, session_state(status.state));
+        println!("cwd: {}", status.launch.cwd.display());
+        println!("command: {}", status.launch.command.join(" "));
+        println!("viewport: {}x{}", status.cols, status.rows);
+        println!(
+            "recording: {}",
+            status
+                .launch
+                .record
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+        );
+    }
+    Ok(())
+}
+
+fn list(args: ListArgs) -> Result<()> {
+    let sessions = session::list()?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+    } else {
+        for entry in sessions {
+            if let Some(status) = entry.status {
                 println!(
                     "{}\t{}\t{}x{}\t{}",
-                    args.name,
+                    entry.name,
                     session_state(status.state),
                     status.cols,
                     status.rows,
                     if status.recording { "recording" } else { "-" }
                 );
-            }
-        }
-        SessionCommand::List(args) => {
-            let sessions = session::list()?;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else {
-                for entry in sessions {
-                    if let Some(status) = entry.status {
-                        println!(
-                            "{}\t{}\t{}x{}\t{}",
-                            entry.name,
-                            session_state(status.state),
-                            status.cols,
-                            status.rows,
-                            if status.recording { "recording" } else { "-" }
-                        );
-                    } else {
-                        println!("{}\tstale\t-\t-", entry.name);
-                    }
-                }
+                let reason = match entry.unavailable {
+                    Some(session::UnavailableReason::IncompatibleProtocol) => "incompatible",
+                    _ => "stale",
+                };
+                println!("{}\t{}\t-\t-", entry.name, reason);
             }
         }
-        SessionCommand::Resize(args) => {
-            validate_terminal_size(args.cols, args.rows)?;
-            session::resize(
-                &args.name,
-                args.cols,
-                args.rows,
-                args.cell_width,
-                args.cell_height,
-            )?;
-        }
-        SessionCommand::History(args) => {
-            let bytes = session::history(&args.name, args.ansi)?;
-            io::stdout()
-                .write_all(&bytes)
-                .context("write session history")?;
-            if !args.ansi && !bytes.ends_with(b"\n") {
-                io::stdout()
-                    .write_all(b"\n")
-                    .context("write session history newline")?;
-            }
-        }
-        SessionCommand::Restart(args) => {
-            start_session(&args, true)?;
-            println!("{}", args.name);
-        }
-        SessionCommand::Stop(args) => session::stop(&args.name)?,
     }
     Ok(())
 }
 
-fn start_session(args: &StartArgs, restart: bool) -> Result<()> {
+fn logs(args: LogsArgs) -> Result<()> {
+    let bytes = session::logs(&args.name, args.ansi)?;
+    io::stdout()
+        .write_all(&bytes)
+        .context("write session logs")?;
+    if !args.ansi && !bytes.ends_with(b"\n") {
+        io::stdout()
+            .write_all(b"\n")
+            .context("write session logs newline")?;
+    }
+    Ok(())
+}
+
+fn start_session(args: &StartArgs) -> Result<()> {
     validate_terminal_size(args.cols, args.rows)?;
     let options = shot_engine::Options {
         cols: args.cols,
@@ -767,23 +791,45 @@ fn start_session(args: &StartArgs, restart: bool) -> Result<()> {
         env: Default::default(),
         inherit_env: true,
     };
-    if restart {
-        session::restart(
-            &args.name,
-            &args.command,
-            args.cwd.as_deref(),
-            args.record.as_deref(),
-            &options,
-        )
+    session::start(
+        &args.name,
+        &args.command,
+        args.cwd.as_deref(),
+        args.record.as_deref(),
+        &options,
+    )
+}
+
+fn restart_session(args: &RestartArgs) -> Result<()> {
+    let previous = session::status(&args.name)?.launch;
+    let cols = args.cols.unwrap_or(previous.cols);
+    let rows = args.rows.unwrap_or(previous.rows);
+    validate_terminal_size(cols, rows)?;
+    let command = if args.command.is_empty() {
+        previous.command
     } else {
-        session::start(
-            &args.name,
-            &args.command,
-            args.cwd.as_deref(),
-            args.record.as_deref(),
-            &options,
-        )
-    }
+        args.command.clone()
+    };
+    let cwd = args.cwd.clone().unwrap_or(previous.cwd);
+    let record = args.record.clone().or(previous.record);
+    session::restart(
+        &args.name,
+        &command,
+        Some(&cwd),
+        record.as_deref(),
+        &shot_engine::Options {
+            cols,
+            rows,
+            cell_width: args.cell_width.unwrap_or(previous.cell_width),
+            cell_height: args.cell_height.unwrap_or(previous.cell_height),
+            max_bytes: args.max_bytes.unwrap_or(previous.max_bytes),
+            opentui_host: args.host.map_or(previous.opentui_host, |host| {
+                matches!(host, HostProfile::Opentui)
+            }),
+            color: args.color.map_or(previous.color, Into::into),
+            ..shot_engine::Options::default()
+        },
+    )
 }
 
 fn session_state(state: session::SessionState) -> &'static str {
@@ -858,66 +904,63 @@ fn validate_terminal_size(cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-fn write_outputs(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<()> {
-    if args.stdout {
-        return write_stdout(captured, args);
-    }
-    if let Some(parent) = args
-        .out
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+fn write_outputs(
+    captured: &shot_engine::Shot,
+    args: &RenderArgs,
+    out: &Path,
+    formats: &[ShotFormat],
+) -> Result<()> {
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let enabled = |format| args.formats.is_empty() || args.formats.contains(&format);
+    let enabled = |format| formats.contains(&format);
     let svg = (enabled(ShotFormat::Svg) || enabled(ShotFormat::Png))
         .then(|| rendered_svg(captured, args));
     if let Some(svg) = svg.as_ref().filter(|_| enabled(ShotFormat::Svg)) {
-        let path = args.out.with_extension("svg");
+        let path = out.with_extension("svg");
         fs::write(&path, svg).with_context(|| format!("write {}", path.display()))?;
         println!("{}", path.display());
     }
     if let Some(svg) = svg.as_ref().filter(|_| enabled(ShotFormat::Png)) {
-        let path = args.out.with_extension("png");
+        let path = out.with_extension("png");
         render::png(svg, &path, args.pixel_ratio)?;
         println!("{}", path.display());
     }
     if enabled(ShotFormat::Json) {
-        let path = args.out.with_extension("json");
+        let path = out.with_extension("json");
         fs::write(&path, serde_json::to_vec_pretty(&captured.frame)?)
             .with_context(|| format!("write {}", path.display()))?;
         println!("{}", path.display());
     }
     if enabled(ShotFormat::Txt) {
-        let path = args.out.with_extension("txt");
+        let path = out.with_extension("txt");
         fs::write(&path, captured.frame.text())
             .with_context(|| format!("write {}", path.display()))?;
         println!("{}", path.display());
     }
     if enabled(ShotFormat::Ansi) {
-        let path = args.out.with_extension("ansi");
+        let path = out.with_extension("ansi");
         fs::write(&path, &captured.ansi).with_context(|| format!("write {}", path.display()))?;
         println!("{}", path.display());
     }
     Ok(())
 }
 
-fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<()> {
-    let format = stdout_format(args)?;
+fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFormat) -> Result<()> {
     let bytes = match format {
         ShotFormat::Txt => captured.frame.text().into_bytes(),
         ShotFormat::Json => serde_json::to_vec_pretty(&captured.frame)?,
         ShotFormat::Ansi => captured.ansi.clone(),
         ShotFormat::Svg => rendered_svg(captured, args).into_bytes(),
-        ShotFormat::Png => unreachable!("stdout format validated before observation"),
+        ShotFormat::Png => unreachable!("show validates PNG before reading source"),
     };
     io::stdout()
         .write_all(&bytes)
-        .context("write shot output")?;
+        .context("write visible screen")?;
     if format != ShotFormat::Ansi && !bytes.ends_with(b"\n") {
         io::stdout()
             .write_all(b"\n")
-            .context("write shot output newline")?;
+            .context("write visible screen newline")?;
     }
     Ok(())
 }
@@ -934,18 +977,6 @@ fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
             show_cursor: !args.hide_cursor,
         },
     )
-}
-
-fn stdout_format(args: &RenderArgs) -> Result<ShotFormat> {
-    let format = match args.formats.as_slice() {
-        [] => ShotFormat::Txt,
-        [format] => *format,
-        _ => bail!("--stdout supports exactly one --format"),
-    };
-    if format == ShotFormat::Png {
-        bail!("--stdout does not support PNG output");
-    }
-    Ok(format)
 }
 
 #[cfg(test)]
@@ -984,10 +1015,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_compact_ordered_input_sequence() {
+    fn parses_one_off_show_input_sequence() {
         let cli = Cli::try_parse_from([
             "cellshot",
-            "shot",
+            "show",
             "--wait-for",
             "ready",
             "-s",
@@ -998,69 +1029,63 @@ mod tests {
             "app",
         ])
         .unwrap();
-        let Command::Shot(args) = cli.command else {
-            panic!("expected shot command");
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
         };
-        assert_eq!(args.send, ["ctrl-p", "text:model", "enter"]);
+        assert!(args.source.name.is_none());
+        assert_eq!(args.source.command, ["app"]);
+        assert_eq!(args.source.send, ["ctrl-p", "text:model", "enter"]);
     }
 
     #[test]
-    fn parses_repeated_shot_formats_and_session_source() {
+    fn parses_explicit_saved_formats_and_named_source() {
         let cli = Cli::try_parse_from([
-            "cellshot",
-            "shot",
-            "--session",
-            "demo",
-            "--format",
-            "png",
-            "--format",
-            "txt",
+            "cellshot", "save", "demo", "--out", "capture", "--format", "png", "--format", "txt",
         ])
         .unwrap();
-        let Command::Shot(args) = cli.command else {
-            panic!("expected shot command");
+        let Command::Save(args) = cli.command else {
+            panic!("expected save command");
         };
-        assert_eq!(args.session.as_deref(), Some("demo"));
-        assert_eq!(args.render.formats, [ShotFormat::Png, ShotFormat::Txt]);
+        assert_eq!(args.source.name.as_deref(), Some("demo"));
+        assert_eq!(args.formats, [ShotFormat::Png, ShotFormat::Txt]);
     }
 
     #[test]
-    fn parses_session_status_resize_and_stdin_send() {
-        assert!(Cli::try_parse_from(["cellshot", "session", "status", "demo", "--json"]).is_ok());
+    fn parses_flat_session_control_commands() {
+        assert!(Cli::try_parse_from(["cellshot", "status", "demo", "--json"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "cellshot", "session", "resize", "demo", "--cols", "120", "--rows", "40"
+                "cellshot", "resize", "demo", "--cols", "120", "--rows", "40"
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["cellshot", "session", "send", "demo", "--stdin"]).is_ok());
-        assert!(Cli::try_parse_from(["cellshot", "session", "history", "demo", "--ansi"]).is_ok());
+        assert!(Cli::try_parse_from(["cellshot", "send", "demo", "--stdin"]).is_ok());
+        assert!(Cli::try_parse_from(["cellshot", "logs", "demo", "--ansi"]).is_ok());
+        assert!(Cli::try_parse_from(["cellshot", "restart", "demo"]).is_ok());
         assert!(
-            Cli::try_parse_from(["cellshot", "session", "restart", "demo", "--", "app"]).is_ok()
+            Cli::try_parse_from(["cellshot", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
     }
 
     #[test]
-    fn validates_stdout_format_before_starting_a_source() {
-        let cli = Cli::try_parse_from([
-            "cellshot", "shot", "--stdout", "--format", "png", "--", "app",
-        ])
-        .unwrap();
-        let Command::Shot(args) = cli.command else {
-            panic!("expected shot command");
+    fn show_rejects_png_before_starting_a_source() {
+        let cli =
+            Cli::try_parse_from(["cellshot", "show", "--format", "png", "--", "app"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
         };
 
         assert_eq!(
-            shot(args).unwrap_err().to_string(),
-            "--stdout does not support PNG output"
+            show(args).unwrap_err().to_string(),
+            "show does not support PNG output; use save --format png --out PATH"
         );
     }
 
     #[test]
-    fn rejects_settling_options_for_pipe_shots() {
+    fn rejects_settling_options_for_pipe_reads() {
         let cli = Cli::try_parse_from([
             "cellshot",
-            "shot",
+            "show",
             "--pipe",
             "--settle-ms",
             "100",
@@ -1068,11 +1093,11 @@ mod tests {
             "true",
         ])
         .unwrap();
-        let Command::Shot(args) = cli.command else {
-            panic!("expected shot command");
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
         };
 
-        assert!(shot(args).is_err());
+        assert!(show(args).is_err());
     }
 
     #[test]

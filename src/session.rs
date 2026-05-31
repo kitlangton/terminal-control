@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -48,6 +49,7 @@ pub struct Session {
     rows: u16,
     cell_width: u16,
     cell_height: u16,
+    launch: SessionLaunch,
 }
 
 /// Lifecycle state of a running or completed session.
@@ -105,7 +107,23 @@ pub struct SessionStatus {
     pub idle_for_ms: Option<u64>,
     pub has_visible_content: bool,
     pub recording: bool,
-    pub history_truncated: bool,
+    pub logs_truncated: bool,
+    pub launch: SessionLaunch,
+}
+
+/// Non-secret launch settings retained for status display and named-session restart.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionLaunch {
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+    pub record: Option<PathBuf>,
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
+    pub max_bytes: usize,
+    pub opentui_host: bool,
+    pub color: shot::ColorMode,
 }
 
 /// One named daemon session discovered in the local runtime directory.
@@ -114,6 +132,15 @@ pub struct NamedSessionStatus {
     pub name: String,
     pub status: Option<SessionStatus>,
     pub error: Option<String>,
+    pub unavailable: Option<UnavailableReason>,
+}
+
+/// Why a named session socket could not report normal status.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    Stale,
+    IncompatibleProtocol,
 }
 
 impl Session {
@@ -130,6 +157,14 @@ impl Session {
         if options.cols == 0 || options.rows == 0 {
             bail!("terminal dimensions must be greater than zero");
         }
+        let cwd = match cwd {
+            Some(cwd) if cwd.is_absolute() => cwd.to_owned(),
+            Some(cwd) => std::env::current_dir()
+                .context("resolve session working directory")?
+                .join(cwd),
+            None => std::env::current_dir().context("resolve session working directory")?,
+        };
+        let cwd = fs::canonicalize(&cwd).context("canonicalize session working directory")?;
         let started = Instant::now();
         let recording = record
             .map(|path| {
@@ -154,9 +189,7 @@ impl Session {
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
         shot::configure_pty_environment(&mut builder, options);
-        if let Some(cwd) = cwd {
-            builder.cwd(cwd);
-        }
+        builder.cwd(&cwd);
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -214,6 +247,18 @@ impl Session {
             rows: options.rows,
             cell_width: options.cell_width,
             cell_height: options.cell_height,
+            launch: SessionLaunch {
+                command: command.to_vec(),
+                cwd,
+                record: record.map(Path::to_owned),
+                cols: options.cols,
+                rows: options.rows,
+                cell_width: options.cell_width,
+                cell_height: options.cell_height,
+                max_bytes: options.max_bytes,
+                opentui_host: options.opentui_host,
+                color: options.color,
+            },
         })
     }
 
@@ -321,11 +366,6 @@ impl Session {
         }
     }
 
-    /// Freeze the current terminal state without inspecting the capture reason.
-    pub fn shot(&mut self, settle: Duration, deadline: Duration) -> Result<Shot> {
-        Ok(self.capture(settle, deadline)?.shot)
-    }
-
     /// Inspect session lifecycle, geometry, and whether a visible frame is available.
     pub fn status(&mut self) -> Result<SessionStatus> {
         self.consume_batch()?;
@@ -345,12 +385,13 @@ impl Session {
                 .map(|last| last.elapsed().as_millis() as u64),
             has_visible_content: from_screen(self.parser.screen()).has_visible_content(),
             recording: self.recording.is_some(),
-            history_truncated: self.ansi_truncated,
+            logs_truncated: self.ansi_truncated,
+            launch: self.launch.clone(),
         })
     }
 
     /// Return readable normal-screen scrollback, or the exact retained ANSI/VT stream.
-    pub fn history(&mut self, ansi: bool) -> Result<Vec<u8>> {
+    pub fn logs(&mut self, ansi: bool) -> Result<Vec<u8>> {
         self.consume_batch()?;
         if ansi {
             return Ok(self.ansi.clone());
@@ -582,11 +623,11 @@ enum Request {
         input: Vec<Vec<u8>>,
         pace_ms: u64,
     },
-    Shot {
+    Show {
         settle_ms: u64,
         deadline_ms: u64,
     },
-    History {
+    Logs {
         ansi: bool,
     },
     Resize {
@@ -603,7 +644,7 @@ struct Response {
     error: Option<String>,
     captured: Option<Shot>,
     status: Option<SessionStatus>,
-    history: Option<Vec<u8>>,
+    logs: Option<Vec<u8>>,
 }
 
 #[doc(hidden)]
@@ -662,16 +703,16 @@ pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
 }
 
 #[doc(hidden)]
-pub fn shot(name: &str, settle: Duration, deadline: Duration) -> Result<Shot> {
+pub fn show(name: &str, settle: Duration, deadline: Duration) -> Result<Shot> {
     request(
         name,
-        Request::Shot {
+        Request::Show {
             settle_ms: settle.as_millis() as u64,
             deadline_ms: deadline.as_millis() as u64,
         },
     )?
     .captured
-    .ok_or_else(|| anyhow::anyhow!("session did not return a shot"))
+    .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
 }
 
 #[doc(hidden)]
@@ -695,10 +736,10 @@ pub fn resize(
 }
 
 #[doc(hidden)]
-pub fn history(name: &str, ansi: bool) -> Result<Vec<u8>> {
-    request(name, Request::History { ansi })?
-        .history
-        .ok_or_else(|| anyhow::anyhow!("session did not return history"))
+pub fn logs(name: &str, ansi: bool) -> Result<Vec<u8>> {
+    request(name, Request::Logs { ansi })?
+        .logs
+        .ok_or_else(|| anyhow::anyhow!("session did not return logs"))
 }
 
 #[doc(hidden)]
@@ -762,7 +803,7 @@ mod implementation {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{NamedSessionStatus, Request, Response, Session};
+    use super::{NamedSessionStatus, Request, Response, Session, UnavailableReason};
     use crate::shot::{self, Options};
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -987,14 +1028,23 @@ mod implementation {
             else {
                 continue;
             };
-            let (status, error) = match request(path, &Request::Status) {
-                Ok(response) => (response.status, response.error),
-                Err(error) => (None, Some(format!("{error:#}"))),
+            let (status, error, unavailable) = match request(path, &Request::Status) {
+                Ok(response) => (response.status, response.error, None),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    let reason = if error.contains("read session response") {
+                        UnavailableReason::IncompatibleProtocol
+                    } else {
+                        UnavailableReason::Stale
+                    };
+                    (None, Some(error), Some(reason))
+                }
             };
             sessions.push(NamedSessionStatus {
                 name,
                 status,
                 error,
+                unavailable,
             });
         }
         sessions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1077,7 +1127,7 @@ mod implementation {
                 error: Some("session request exceeds 1 MiB".to_owned()),
                 captured: None,
                 status: None,
-                history: None,
+                logs: None,
             },
             Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
                 Ok(request) => {
@@ -1088,7 +1138,7 @@ mod implementation {
                             error: Some(format!("{error:#}")),
                             captured: None,
                             status: None,
-                            history: None,
+                            logs: None,
                         },
                     };
                     if write_response(&mut stream, &response).is_ok() && stop {
@@ -1100,14 +1150,14 @@ mod implementation {
                     error: Some(format!("invalid session request: {error}")),
                     captured: None,
                     status: None,
-                    history: None,
+                    logs: None,
                 },
             },
             Err(error) => Response {
                 error: Some(format!("failed to read session request: {error}")),
                 captured: None,
                 status: None,
-                history: None,
+                logs: None,
             },
         };
         let _ = write_response(&mut stream, &response);
@@ -1124,7 +1174,7 @@ mod implementation {
             error: None,
             captured: None,
             status: None,
-            history: None,
+            logs: None,
         };
         match request {
             Request::Ping => {}
@@ -1135,16 +1185,20 @@ mod implementation {
             Request::Wait { text, timeout_ms } => {
                 session.wait_for_text(&text, Duration::from_millis(timeout_ms))?;
             }
-            Request::Shot {
+            Request::Show {
                 settle_ms,
                 deadline_ms,
             } => {
-                response.captured = Some(session.shot(
-                    Duration::from_millis(settle_ms),
-                    Duration::from_millis(deadline_ms),
-                )?);
+                response.captured = Some(
+                    session
+                        .capture(
+                            Duration::from_millis(settle_ms),
+                            Duration::from_millis(deadline_ms),
+                        )?
+                        .shot,
+                );
             }
-            Request::History { ansi } => response.history = Some(session.history(ansi)?),
+            Request::Logs { ansi } => response.logs = Some(session.logs(ansi)?),
             Request::Resize {
                 cols,
                 rows,
@@ -1234,7 +1288,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn embedded_session_waits_sends_resizes_and_takes_a_shot() {
+    fn embedded_session_waits_sends_resizes_and_captures_the_screen() {
         let mut session = Session::start(
             &[
                 "sh".to_owned(),
@@ -1267,14 +1321,14 @@ mod tests {
             .unwrap();
         session.resize(30, 5, 9, 18).unwrap();
         let shot = session
-            .shot(Duration::from_millis(10), Duration::from_secs(2))
+            .capture(Duration::from_millis(10), Duration::from_secs(2))
             .unwrap();
 
-        assert_eq!((shot.frame.cols, shot.frame.rows), (30, 5));
-        assert!(shot.frame.text().contains("got:hello"));
+        assert_eq!((shot.shot.frame.cols, shot.shot.frame.rows), (30, 5));
+        assert!(shot.shot.frame.text().contains("got:hello"));
         session.stop().unwrap();
         assert_eq!(session.status().unwrap().state, SessionState::Exited);
-        assert!(session.shot(Duration::ZERO, Duration::ZERO).is_ok());
+        assert!(session.capture(Duration::ZERO, Duration::ZERO).is_ok());
     }
 
     #[cfg(unix)]
@@ -1322,8 +1376,8 @@ mod tests {
             .wait_for_text("123456789", Duration::from_secs(2))
             .unwrap();
 
-        assert_eq!(session.history(true).unwrap(), b"6789");
-        assert!(session.status().unwrap().history_truncated);
+        assert_eq!(session.logs(true).unwrap(), b"6789");
+        assert!(session.status().unwrap().logs_truncated);
         session.stop().unwrap();
     }
 
@@ -1348,6 +1402,23 @@ mod tests {
         };
 
         assert_eq!(status.exit.unwrap().code, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_retains_canonical_launch_details() {
+        let mut session = Session::start(
+            &["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()],
+            Some(Path::new("/tmp")),
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+
+        let status = session.status().unwrap();
+        assert_eq!(status.launch.command[0], "sh");
+        assert_eq!(status.launch.cwd, std::fs::canonicalize("/tmp").unwrap());
+        session.stop().unwrap();
     }
 
     #[cfg(unix)]
@@ -1402,7 +1473,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn history_exposes_normal_screen_scrollback_and_raw_stream() {
+    fn logs_expose_normal_screen_scrollback_and_raw_stream() {
         let mut session = Session::start(
             &[
                 "sh".to_owned(),
@@ -1422,12 +1493,12 @@ mod tests {
             .wait_for_text("five", Duration::from_secs(2))
             .unwrap();
 
-        let history = String::from_utf8(session.history(false).unwrap()).unwrap();
-        assert!(history.contains("one"));
-        assert!(history.contains("five"));
+        let logs = String::from_utf8(session.logs(false).unwrap()).unwrap();
+        assert!(logs.contains("one"));
+        assert!(logs.contains("five"));
         assert!(
             session
-                .history(true)
+                .logs(true)
                 .unwrap()
                 .windows(3)
                 .any(|bytes| bytes == b"one")

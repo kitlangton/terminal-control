@@ -101,8 +101,8 @@ enum Method {
     WaitForText(WaitForTextParams),
     WaitForIdle(WaitForIdleParams),
     WaitForExit(WaitForExitParams),
-    Shot(ShotParams),
-    History(HistoryParams),
+    Capture(CaptureParams),
+    Logs(LogsParams),
     Recording,
     Resize(ResizeParams),
     Stop,
@@ -204,7 +204,7 @@ struct WaitForExitParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ShotParams {
+struct CaptureParams {
     #[serde(default = "default_settle_ms")]
     settle_ms: u64,
     #[serde(default = "default_timeout_ms")]
@@ -216,7 +216,7 @@ struct ShotParams {
 }
 
 #[derive(Default, Deserialize)]
-struct HistoryParams {
+struct LogsParams {
     #[serde(default)]
     ansi: bool,
 }
@@ -354,7 +354,7 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                 None => json!({ "reason": "deadline" }),
             })
         }
-        Method::Shot(params) => {
+        Method::Capture(params) => {
             let mut session = session(sessions, &request.session_id)?;
             let mut capture = session.capture(
                 Duration::from_millis(params.settle_ms),
@@ -382,9 +382,9 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
             }
             Ok(result)
         }
-        Method::History(params) => Ok(json!({
+        Method::Logs(params) => Ok(json!({
             "ansi": params.ansi,
-            "bytes": session(sessions, &request.session_id)?.history(params.ansi)?
+            "bytes": session(sessions, &request.session_id)?.logs(params.ansi)?
         })),
         Method::Recording => {
             let session_id = required_session_id(&request.session_id)?;
@@ -566,7 +566,7 @@ mod tests {
             "\n",
             r#"{"id":4,"method":"waitForText","sessionId":"app","params":{"text":"got:hello","timeoutMs":2000}}"#,
             "\n",
-            r#"{"id":5,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":true}}"#,
+            r#"{"id":5,"method":"capture","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":true}}"#,
             "\n",
             r#"{"id":6,"method":"stop","sessionId":"app"}"#,
             "\n",
@@ -605,7 +605,7 @@ mod tests {
             "\n",
             r#"{"id":2,"method":"waitForText","sessionId":"app","params":{"text":"ready","timeoutMs":2000}}"#,
             "\n",
-            r#"{"id":3,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":false}}"#,
+            r#"{"id":3,"method":"capture","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":false}}"#,
             "\n",
             r#"{"id":4,"method":"shutdown"}"#,
             "\n"
@@ -634,7 +634,7 @@ mod tests {
         let requests = concat!(
             r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["/bin/sh","-c","printf '%s:%s' \"${CELLSHOT_PARENT_ONLY-unset}\" \"$VISIBLE\""],"inheritEnv":false,"env":{"VISIBLE":"set"}}}"#,
             "\n",
-            r#"{"id":2,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000}}"#,
+            r#"{"id":2,"method":"capture","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000}}"#,
             "\n",
             r#"{"id":3,"method":"shutdown"}"#,
             "\n"
@@ -663,7 +663,7 @@ mod tests {
             "\n",
             r#"{"id":2,"method":"waitForExit","sessionId":"app","params":{"timeoutMs":2000}}"#,
             "\n",
-            r#"{"id":3,"method":"shot","sessionId":"app","params":{"includeSvg":true}}"#,
+            r#"{"id":3,"method":"capture","sessionId":"app","params":{"includeSvg":true}}"#,
             "\n",
             r#"{"id":4,"method":"shutdown"}"#,
             "\n"

@@ -2,9 +2,9 @@
 
 ## Glossary
 
-### Shot
+### Capture
 
-One exported visible terminal frame and any selected artifact formats derived from it. A shot can observe a launched command, piped command output, an ANSI/VT stream, or a live session.
+One explicitly saved artifact representation of a visible terminal frame. A capture can be derived from a launched command, piped command output, an ANSI/VT stream, or a live session. Routine reads of visible terminal state are called `show` operations and print to standard output rather than creating capture artifacts.
 
 ### Frame
 
@@ -12,13 +12,13 @@ The versioned structured visible terminal state underlying a shot. A frame conta
 
 ### Session
 
-A named terminal application that remains available across waiting, input, resizing, history inspection, and shots. A session is `running` while accepting input, or `exited` when its application has ended but its final shot remains inspectable until explicitly stopped. A session retains bounded normal-screen scrollback for log-oriented history inspection and the most recent bounded ANSI/VT transcript bytes; alternate-screen TUIs are observed as shots rather than scrollback. A session may write a recording timeline while it runs, including viewport resize events.
+A named terminal application that remains available across waiting, input, resizing, log inspection, and visible-screen reads or captures. A session is `running` while accepting input, or `exited` when its application has ended but its final screen remains inspectable until explicitly stopped. A session retains bounded readable logs and the most recent bounded ANSI/VT transcript bytes; alternate-screen TUIs are read with `show` rather than logs. A session may write a recording timeline while it runs, including viewport resize events. Named CLI sessions retain non-secret launch settings so status can identify them and restart can reuse their command and working directory.
 
 An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations.
 
 ### Driver
 
-A versioned JSON Lines stdin/stdout adapter over embedded sessions for external agent tooling and the experimental TypeScript test client. A driver process can manage multiple isolated sessions without exposing terminal process details to its client. Its shot response includes the reason capture completed so test clients can distinguish settled screen state from deadline fallback, and can optionally include ANSI or rendered SVG failure evidence.
+A versioned JSON Lines stdin/stdout adapter over embedded sessions for external agent tooling and the TypeScript test client. A driver process can manage multiple isolated sessions without exposing terminal process details to its client. Its capture response includes the reason capture completed so test clients can distinguish settled screen state from deadline fallback, and can optionally include ANSI or rendered SVG failure evidence.
 
 ### Recording
 

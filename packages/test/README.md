@@ -1,6 +1,6 @@
 # @cellshot/test
 
-Typed terminal application testing client for `cellshot driver`, with stable screen snapshots, keyboard interaction, recordings, and opt-in failure evidence.
+Typed terminal application testing client for `cellshot driver`, with stable screen snapshots, keyboard interaction, readable logs, recordings, and opt-in failure evidence.
 
 Install the package with Vitest after the initial npm publication:
 
@@ -26,4 +26,4 @@ await session.screen.waitForText("Ready")
 expect(await session.screen.text()).toMatchSnapshot()
 ```
 
-Artifact and recording configuration is opt-in because terminal output and input may contain secrets. See the repository `README.md` for the complete workflow.
+For line-oriented output, use `session.logs.text()`; for exact ANSI/VT bytes, use `session.transcript.ansi()`. Artifact and recording configuration is opt-in because terminal output and input may contain secrets. See the repository `README.md` for the complete workflow.

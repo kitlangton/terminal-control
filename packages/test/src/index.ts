@@ -77,7 +77,7 @@ export type SessionStatus = {
   idleForMs: number | null
   hasVisibleContent: boolean
   recording: boolean
-  historyTruncated: boolean
+  logsTruncated: boolean
 }
 
 type WireShot = { frame: Frame; text: string; ansi: number[]; svg?: string }
@@ -94,7 +94,7 @@ type WireSessionStatus = {
   idle_for_ms: number | null
   has_visible_content: boolean
   recording: boolean
-  history_truncated: boolean
+  logs_truncated: boolean
 }
 
 export type ControlLetter =
@@ -180,7 +180,7 @@ export type ArtifactManifest = {
   screenFrame: string
   screenSvg: string
   metadata: string
-  historyText: string
+  logsText: string
   transcript?: string
   recording?: string
 }
@@ -440,7 +440,7 @@ export class Cellshot implements AsyncDisposable {
 export class Session implements AsyncDisposable {
   readonly screen: Screen
   readonly keyboard: Keyboard
-  readonly history: History
+  readonly logs: Logs
   readonly transcript: Transcript
   private stopped = false
 
@@ -453,7 +453,7 @@ export class Session implements AsyncDisposable {
   ) {
     this.screen = new Screen(request, id)
     this.keyboard = new Keyboard(request, id)
-    this.history = new History(request, id)
+    this.logs = new Logs(request, id)
     this.transcript = new Transcript(request, id)
   }
 
@@ -468,7 +468,7 @@ export class Session implements AsyncDisposable {
       idleForMs: status.idle_for_ms,
       hasVisibleContent: status.has_visible_content,
       recording: status.recording,
-      historyTruncated: status.history_truncated,
+      logsTruncated: status.logs_truncated,
     }))
   }
 
@@ -509,7 +509,7 @@ export class Session implements AsyncDisposable {
       includeSvg: true,
       deadlineMs: 250,
     })
-    const [history, status] = await Promise.all([this.history.text(), this.status()])
+    const [logs, status] = await Promise.all([this.logs.text(), this.status()])
     await mkdir(directory, { recursive: true })
     const manifest: ArtifactManifest = {
       directory,
@@ -517,13 +517,13 @@ export class Session implements AsyncDisposable {
       screenFrame: join(directory, "screen.json"),
       screenSvg: join(directory, "screen.svg"),
       metadata: join(directory, "metadata.json"),
-      historyText: join(directory, "history.txt"),
+      logsText: join(directory, "logs.txt"),
     }
     await Promise.all([
       writeFile(manifest.screenText, capture.text),
       writeFile(manifest.screenFrame, JSON.stringify(capture.frame, null, 2)),
       writeFile(manifest.screenSvg, capture.svg ?? ""),
-      writeFile(manifest.historyText, history),
+      writeFile(manifest.logsText, logs),
       writeFile(manifest.metadata, JSON.stringify({
         sessionId: this.id,
         captureReason: capture.reason,
@@ -598,7 +598,7 @@ export class Screen {
   }
 
   async capture(options: CaptureOptions = {}): Promise<ScreenSnapshot> {
-    const wire = await this.request<WireCaptureResult>("shot", {
+    const wire = await this.request<WireCaptureResult>("capture", {
       settleMs: options.settleMs,
       deadlineMs: options.deadlineMs,
       includeAnsi: options.includeAnsi === true,
@@ -615,10 +615,6 @@ export class Screen {
       throw new IncompleteCaptureError(capture)
     }
     return capture
-  }
-
-  async shot(options: StableCaptureOptions = {}): Promise<ScreenSnapshot> {
-    return this.capture(options)
   }
 
   async frame(options: StableCaptureOptions = {}): Promise<Frame> {
@@ -654,11 +650,11 @@ export class Keyboard {
   }
 }
 
-export class History {
+export class Logs {
   constructor(private readonly request: DriverRequest, private readonly sessionId: string) {}
 
   async text(): Promise<string> {
-    const result = await this.request<{ bytes: number[] }>("history", { ansi: false }, this.sessionId)
+    const result = await this.request<{ bytes: number[] }>("logs", { ansi: false }, this.sessionId)
     return new TextDecoder().decode(Uint8Array.from(result.bytes))
   }
 }
@@ -667,7 +663,7 @@ export class Transcript {
   constructor(private readonly request: DriverRequest, private readonly sessionId: string) {}
 
   async ansi(): Promise<Uint8Array> {
-    const result = await this.request<{ bytes: number[] }>("history", { ansi: true }, this.sessionId)
+    const result = await this.request<{ bytes: number[] }>("logs", { ansi: true }, this.sessionId)
     return Uint8Array.from(result.bytes)
   }
 }

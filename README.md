@@ -1,13 +1,13 @@
 # cellshot
 
-Native screenshots and interaction recordings of real terminal applications for agents and TUI review.
+Control, inspect, test, and capture real terminal applications for agents and TUI review.
 
 [![crates.io](https://img.shields.io/crates/v/cellshot.svg)](https://crates.io/crates/cellshot)
 [![CI](https://github.com/kitlangton/cellshot/actions/workflows/ci.yml/badge.svg)](https://github.com/kitlangton/cellshot/actions/workflows/ci.yml)
 
 ![OpenCode answering a playful request for cellshot haikus](https://raw.githubusercontent.com/kitlangton/cellshot/main/docs/screenshots/opencode-haikus.png)
 
-Captured from one live OpenCode session using `session` and `shot`.
+Saved from one live OpenCode session using `start`, `send`, and `save`.
 
 ## Install
 
@@ -24,92 +24,102 @@ Install the current repository head instead of the latest crate release:
 cargo install --locked --git https://github.com/kitlangton/cellshot cellshot
 ```
 
-## Export One Shot
+## Show A Terminal Screen
 
-Run a program in a PTY and export its visible terminal state:
-
-```bash
-cellshot shot --cols 100 --rows 32 --out captures/home -- my-terminal-app
-```
-
-By default, each shot writes inspectable artifacts:
-
-```text
-captures/home.png    visual review, rendered at 2x scale by default
-captures/home.svg    resolution-independent image
-captures/home.txt    visible text
-captures/home.json   styled terminal cells
-captures/home.ansi   captured terminal stream
-```
-
-Wait for an application to mount, then interact before taking the screenshot:
+Run a program in a PTY and print its visible terminal state:
 
 ```bash
-cellshot shot --cols 100 --rows 32 --wait-for "Commands" \
-  -s ctrl-p text:model enter --out captures/model -- my-terminal-app
+cellshot show --cols 100 --rows 32 -- my-terminal-app
+```
+
+Show is the routine observation command: it prints visible text to standard output and creates no files. Request a different stdout-readable representation explicitly:
+
+```bash
+cellshot show --format json -- my-terminal-app
+cellshot show --format svg -- my-terminal-app
+```
+
+Wait for an application to mount, then interact before reading its screen:
+
+```bash
+cellshot show --cols 100 --rows 32 --wait-for "Commands" \
+  -s ctrl-p text:model enter -- my-terminal-app
 ```
 
 OpenTUI applications such as OpenCode require the opt-in host handshake:
 
 ```bash
-cellshot shot --host opentui --cols 112 --rows 34 \
-  --wait-for "/connect" --out captures/opencode -- opencode
+cellshot show --host opentui --cols 112 --rows 34 \
+  --wait-for "/connect" -- opencode
 ```
 
-## Drive A Live TUI
+## Save Evidence
 
-Use a named session when several shots should come from the same running application:
+Write only the artifact formats you request:
 
 ```bash
-cellshot session start demo --host opentui --cols 112 --rows 34 -- opencode
-cellshot session status demo --json
-cellshot session wait demo "/connect"
-cellshot shot --session demo --stdout
-cellshot shot --session demo --format png --hide-cursor --out captures/home
-cellshot session send demo text:/connect enter
-cellshot session resize demo --cols 132 --rows 38
-cellshot session wait demo "Connect a provider"
-cellshot shot --session demo --format png --hide-cursor --out captures/provider
-cellshot session stop demo
+cellshot save --format png --out captures/home.png -- my-terminal-app
+cellshot save --format png --format txt --out captures/model -- my-terminal-app
 ```
 
-`session status` reports `running` or `exited`; an exited session retains its final screen for `shot --session` until it is stopped. Use `session list --json` to discover local named sessions and stale sockets.
+The second command writes `captures/model.png` and `captures/model.txt`. ANSI stream artifacts can contain sensitive terminal data and are only produced when explicitly requested with `--format ansi`.
 
-`session send` accepts `ctrl-a` through `ctrl-z`, keys such as `enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, and `page-down`, plus typed input as `text:<value>`. Use `ctrl-c` to interrupt work or pipe exact prompt bytes with `--stdin`:
+## Control A Live TUI
+
+Use a named session when several observations or interactions should target the same running application:
 
 ```bash
-printf '%s' 'Summarize the active view.' | cellshot session send demo --stdin
+cellshot start demo --host opentui --cols 112 --rows 34 -- opencode
+cellshot status demo
+cellshot wait demo "/connect" --timeout 5000
+cellshot show demo
+cellshot send demo text:/connect enter
+cellshot resize demo --cols 132 --rows 38
+cellshot wait demo "Connect a provider" --timeout 5000
+cellshot show demo
+cellshot save demo --format png --out captures/provider.png
+cellshot stop demo
 ```
 
-`session resize` controls the terminal viewport and records geometry changes in `.cellshot` timelines when recording is enabled. A session whose retained ANSI transcript has already been truncated cannot be resized because its current screen cannot be replayed at a new size safely.
+`status` reports `running` or `exited`, the effective working directory, command, viewport, and recording path. An exited session retains its final screen for `show` until it is stopped. `list` distinguishes unavailable stale sockets from incompatible older session protocols.
+
+`send` accepts `ctrl-a` through `ctrl-z`, keys such as `enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, and `page-down`, plus typed input as `text:<value>`. Use `ctrl-c` to interrupt work or pipe exact prompt bytes with `--stdin`:
+
+```bash
+printf '%s' 'Summarize the active view.' | cellshot send demo --stdin
+```
+
+`resize` controls the terminal viewport and records geometry changes in `.cellshot` timelines when recording is enabled. A session whose retained ANSI transcript has already been truncated cannot be resized because its current screen cannot be replayed at a new size safely.
 
 For normal-screen tools and long-running log processes, inspect retained scrollback directly:
 
 ```bash
-cellshot session history demo
-cellshot session history demo --ansi > captures/demo-history.ansi
+cellshot logs demo
+cellshot logs demo --ansi > captures/demo-output.ansi
 ```
 
-Full-screen alternate-screen TUIs do not provide terminal scrollback; observe those with `shot` or a recording timeline instead. Session status exposes `history_truncated` after raw retained ANSI reaches `--max-bytes`; the session continues running and retains its most recent transcript bytes.
+Full-screen alternate-screen TUIs do not provide useful terminal logs; read their visible screen with `show` or retain a recording timeline instead. Status exposes `logs_truncated` after raw retained ANSI reaches `--max-bytes`; the session continues running and retains its most recent transcript bytes.
 
 Restart a single named owner safely when deploying updated code:
 
 ```bash
-cellshot session restart demo --host opentui --cols 112 --rows 34 -- opencode
+cellshot restart demo
 ```
+
+`restart NAME` reuses the prior command, effective working directory, viewport, host profile, color policy, and recording path by default. Supply options or a replacement command only when deliberately changing the launch.
 
 ## Record A Video
 
 Record a session timeline and replay it as an MP4:
 
 ```bash
-cellshot session start demo --record captures/demo.cellshot \
+cellshot start demo --record captures/demo.cellshot \
   --host opentui --cols 112 --rows 34 -- opencode
-cellshot session wait demo "Ask anything"
-cellshot session send demo --pace-ms 35 'text:Write a short terminal haiku. End with the uppercase form of done.' enter
-cellshot session wait demo "DONE" --timeout-ms 60000
-cellshot shot --session demo --format png --out captures/answer
-cellshot session stop demo
+cellshot wait demo "Ask anything"
+cellshot send demo --pace-ms 35 'text:Write a short terminal haiku. End with the uppercase form of done.' enter
+cellshot wait demo "DONE" --timeout 60000
+cellshot save demo --format png --out captures/answer.png
+cellshot stop demo
 
 cellshot video captures/demo.cellshot --hide-cursor --out captures/demo.mp4
 ```
@@ -118,34 +128,35 @@ Video export trims startup frames before non-whitespace text by default, while s
 
 Recordings are JSON Lines files containing terminal output, client input, and automatic host input; they can include prompts or secrets. Treat them as sensitive artifacts.
 
-## Select Formats And Sources
+## Sources And Formats
 
 Repeat `--format` to export only what you need:
 
 ```bash
-cellshot shot --format png --format txt --out captures/home -- my-terminal-app
+cellshot save --format png --format txt --out captures/home -- my-terminal-app
 ```
 
-Write the current visible text directly to stdout for agent inspection, or select JSON/ANSI/SVG explicitly:
+Read a current visible screen directly for agent inspection, or select JSON/ANSI/SVG explicitly:
 
 ```bash
-cellshot shot --session demo --stdout
-cellshot shot --session demo --stdout --format json
+cellshot show demo
+cellshot show demo --format json
 ```
 
-For commands whose useful output is piped, use `--pipe`. Pipe shots force color by default; pass `--color never` for plain output:
+For commands whose useful output is piped, use `--pipe`. Pipe reads force color by default; pass `--color never` for plain output:
 
 ```bash
-cellshot shot --pipe --format png --format txt --cols 100 --rows 16 \
+cellshot save --pipe --format png --format txt --cols 100 --rows 16 \
   --out captures/log -- my-command
 ```
 
-Shots own disposable command processes: once a command shot completes or reaches its deadline, its launched process tree is terminated. Use a named `session` for long-running applications.
+One-off `show` and `save` operations own disposable command processes: once the visible screen is read or saved, the launched process tree is terminated. Use `start` for long-running applications.
 
 Render an existing ANSI/VT terminal stream without launching a process. An `.ansi` file is a conventionally named byte stream of terminal output and escape sequences, not a separate container format:
 
 ```bash
-printf '\033[44;97m terminal output \033[0m\n' | cellshot shot --input - --out captures/stdin
+printf '\033[44;97m terminal output \033[0m\n' | cellshot show --input -
+printf '\033[44;97m terminal output \033[0m\n' | cellshot save --input - --format png --out captures/stdin.png
 ```
 
 ## Rust Library And Formats
@@ -181,11 +192,11 @@ session.stop()?;
 
 Structured output is versioned for external tools:
 
-- A `--format json` shot is a `Frame` object with `version: 1`, described by `schemas/frame-v1.schema.json`.
+- A `save --format json` capture is a `Frame` object with `version: 1`, described by `schemas/frame-v1.schema.json`.
 - A `.cellshot` recording is JSON Lines: its first line is a versioned header and subsequent lines are timed output, input, or resize entries, each described by `schemas/recording-entry-v1.schema.json`.
 - Recording byte arrays contain the original terminal or input bytes as integers from `0` to `255`; recordings can contain sensitive text or input.
 
-`session::Session` is the embedded lifecycle interface; the named CLI session commands and the external driver are adapters over the same implementation.
+`session::Session` is the embedded lifecycle interface; the flat named-session CLI commands and the external driver are adapters over the same implementation.
 
 ## External Driver
 
@@ -195,21 +206,21 @@ External agent tooling can keep multiple embedded sessions alive through a versi
 cellshot driver
 ```
 
-The driver writes a `hello` message with protocol and cellshot versions, then accepts typed operations including `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `waitForExit`, `shot`, `history`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as a TypeScript TUI test or agent-control library, while the shell-facing `session` commands remain convenient for individual workflows.
+The driver writes a `hello` message with protocol and cellshot versions, then accepts typed operations including `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `waitForExit`, `capture`, `logs`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as a TypeScript TUI test or agent-control library, while the shell-facing flat commands remain convenient for individual workflows.
 
 ```json
 {"type":"hello","protocolVersion":1,"cellshotVersion":"<installed-version>"}
 {"id":1,"method":"launch","sessionId":"app","params":{"command":["my-terminal-app"],"cols":100,"rows":30,"inheritEnv":false,"env":{"TERM":"xterm-256color"}}}
 {"id":2,"method":"waitForText","sessionId":"app","params":{"text":"Ready","timeoutMs":5000}}
 {"id":3,"method":"send","sessionId":"app","params":{"input":[{"type":"text","value":"help"},{"type":"key","value":"enter"}]}}
-{"id":4,"method":"shot","sessionId":"app","params":{"settleMs":250,"deadlineMs":5000}}
+{"id":4,"method":"capture","sessionId":"app","params":{"settleMs":250,"deadlineMs":5000}}
 ```
 
-A driver `shot` response contains a structured visible frame, derived `text`, and a capture `reason`: `idle`, `deadline`, `exited`, or `outputclosed`. Raw ANSI is omitted by default; request `includeAnsi: true` for retained transcript bytes or `includeSvg: true` for rendered visual evidence. A test client should normally require `idle` or `exited` instead of accepting a deadline fallback as a stable snapshot. Driver input is intentionally exact: text, raw bytes, known key values, and single-letter control input are supported without claiming unimplemented key chords.
+A driver `capture` response contains a structured visible frame, derived `text`, and a completion `reason`: `idle`, `deadline`, `exited`, or `outputclosed`. Raw ANSI is omitted by default; request `includeAnsi: true` for retained transcript bytes or `includeSvg: true` for rendered visual evidence. A test client should normally require `idle` or `exited` instead of accepting a deadline fallback as a stable snapshot. Driver input is intentionally exact: text, raw bytes, known key values, and single-letter control input are supported without claiming unimplemented key chords.
 
 ## TypeScript Client
 
-`@cellshot/test` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from retained history and the exact ANSI/VT transcript. Its npm distribution includes an optional native package for macOS or GNU/Linux on arm64 or x64, so consumers do not need a Rust toolchain or separate `cellshot` installation.
+`@cellshot/test` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from readable retained logs and the exact ANSI/VT transcript. Its npm distribution includes an optional native package for macOS or GNU/Linux on arm64 or x64, so consumers do not need a Rust toolchain or separate `cellshot` installation.
 
 After the initial npm publication:
 
@@ -242,7 +253,7 @@ await session.keyboard.press("Enter")
 
 const text = await session.screen.text()
 const frame = await session.screen.frame()
-const history = await session.history.text()
+const logs = await session.logs.text()
 const transcript = await session.transcript.ansi()
 
 expect(text).toMatchSnapshot()
@@ -277,7 +288,7 @@ await expect(session).toHaveScreenText("Ready\n\nChoose an option")
 await expect(session.screen.text()).resolves.toMatchInlineSnapshot()
 ```
 
-`session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `history.txt`, and `metadata.json`. Environment variable values are redacted in metadata. `transcript.ansi` and `recording.cellshot` are opt-in because terminal streams and typed input may contain secrets. Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
+`session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `logs.txt`, and `metadata.json`. Environment variable values are redacted in metadata. `transcript.ansi` and `recording.cellshot` are opt-in because terminal streams and typed input may contain secrets. Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
 
 ```ts
 await session.withArtifactsOnFailure("settings-snapshot", async () => {

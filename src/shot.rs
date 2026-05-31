@@ -67,7 +67,8 @@ pub struct Shot {
 }
 
 /// Environment policy applied to a launched command's color configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ColorMode {
     Auto,
     Always,

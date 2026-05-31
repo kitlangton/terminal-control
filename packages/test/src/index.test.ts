@@ -58,7 +58,7 @@ describe("isolated terminal sessions", () => {
     expect((await session.transcript.ansi()).byteLength).toBeGreaterThan(0)
   })
 
-  test("exposes current viewport separately from history", async () => {
+  test("exposes current screen separately from logs", async () => {
     await using session = await cellshot.launch({
       command: ["sh", "-c", "printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; sleep 1"],
       viewport: { cols: 20, rows: 2 },
@@ -67,7 +67,7 @@ describe("isolated terminal sessions", () => {
     await session.screen.waitForText("five", { timeoutMs: 2_000 })
 
     expect(await session.screen.text({ settleMs: 10, deadlineMs: 2_000 })).not.toContain("one")
-    expect(await session.history.text()).toContain("one")
+    expect(await session.logs.text()).toContain("one")
   })
 
   test("refuses to treat a deadline capture as stable by default", async () => {

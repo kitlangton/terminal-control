@@ -2,7 +2,7 @@
 
 ## Repository
 
-- `cellshot` is a Rust library and CLI binary. Public vocabulary is `shot` for one frame export, `session` for a live terminal lifecycle, and `video` for a recorded timeline export.
+- `cellshot` is a Rust library and CLI binary. Public CLI vocabulary is `show` for reading visible terminal state, `save` for explicit retained artifacts, a named `session` for the live terminal lifecycle managed by flat control commands, `logs` for readable retained output, and `video` for a recorded timeline export.
 - Keep `README.md` and the Clap help in `src/main.rs` aligned when changing commands, formats, sessions, recording, or OpenTUI support.
 - Prefer focused fixes with unit tests in the affected module.
 
