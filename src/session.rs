@@ -202,6 +202,7 @@ impl Session {
             max_bytes: options.max_bytes,
             output_closed: false,
             stopped: false,
+            exit: None,
             last_output: None,
             recording,
             cols: options.cols,
@@ -270,23 +271,39 @@ impl Session {
         }
     }
 
-    /// Freeze the current terminal state after output settles or the deadline elapses.
-    pub fn shot(&mut self, settle: Duration, deadline: Duration) -> Result<Shot> {
+    /// Capture visible terminal state and report whether it settled, exited, or reached a limit.
+    pub fn capture(&mut self, settle: Duration, deadline: Duration) -> Result<CaptureResult> {
         let started = Instant::now();
         let deadline = started + deadline;
         loop {
             self.consume()?;
-            if self.output_closed
-                || self.last_output.unwrap_or(started).elapsed() >= settle
-                || Instant::now() >= deadline
-            {
-                return Ok(Shot {
-                    frame: from_screen(self.parser.screen()),
-                    ansi: self.ansi.clone(),
+            let reason = if self.has_exited()? || self.stopped {
+                Some(CaptureReason::Exited)
+            } else if self.output_closed {
+                Some(CaptureReason::OutputClosed)
+            } else if self.last_output.unwrap_or(started).elapsed() >= settle {
+                Some(CaptureReason::Idle)
+            } else if Instant::now() >= deadline {
+                Some(CaptureReason::Deadline)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Ok(CaptureResult {
+                    shot: Shot {
+                        frame: from_screen(self.parser.screen()),
+                        ansi: self.ansi.clone(),
+                    },
+                    reason,
                 });
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Freeze the current terminal state without inspecting the capture reason.
+    pub fn shot(&mut self, settle: Duration, deadline: Duration) -> Result<Shot> {
+        Ok(self.capture(settle, deadline)?.shot)
     }
 
     /// Inspect session lifecycle, geometry, and whether a visible frame is available.
@@ -298,6 +315,7 @@ impl Session {
             } else {
                 SessionState::Running
             },
+            exit: self.exit.clone(),
             cols: self.cols,
             rows: self.rows,
             cell_width: self.cell_width,
@@ -419,11 +437,14 @@ impl Session {
     }
 
     fn has_exited(&mut self) -> Result<bool> {
-        Ok(self
-            .child
-            .try_wait()
-            .context("poll session command")?
-            .is_some())
+        if self.exit.is_some() {
+            return Ok(true);
+        }
+        if let Some(status) = self.child.try_wait().context("poll session command")? {
+            self.exit = Some(status.into());
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn terminate(&mut self) {
@@ -437,7 +458,11 @@ impl Session {
             }
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.exit.is_none()
+            && let Ok(status) = self.child.wait()
+        {
+            self.exit = Some(status.into());
+        }
         self.output_closed = true;
         self.stopped = true;
     }
