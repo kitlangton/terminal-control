@@ -82,7 +82,8 @@ const VIDEO_HELP: &str = "\
 Replay a recording produced by `termctrl start --record` into a video artifact. Without `--edit`,
 the video preserves observed timing. For a concise annotated demo, add named moments while recording
 with `termctrl mark`, then pass an edit-plan JSON file with `--edit`. Each clip selects a marker range
-and may set `speed`, `hold_ms`, or a visible `caption`.
+and may set `speed`, optional visible `caption`, or optional `hold_ms`. Omit `hold_ms` for no artificial
+pause between clips. Use `--tail-ms 0` if the final frame should not be held after the last clip.
 
 `--fps` controls the maximum sampled frame rate; identical rendered screens are rasterized once and
 reused. Pass `--include-startup` to retain blank startup or capability negotiation frames. The source
@@ -96,7 +97,19 @@ Example:
   termctrl mark demo after-connect
   termctrl stop demo
   termctrl markers captures/demo.termctrl
-  termctrl video captures/demo.termctrl --edit captures/demo.json --out captures/demo.mp4";
+  termctrl video captures/demo.termctrl --edit captures/demo.json --tail-ms 0 --out captures/demo.mp4";
+
+const MARK_HELP: &str = "\
+Add a named marker to the active `.termctrl` recording at the current session time. Markers do not
+change the raw recording; they give later `show --recording --at-marker` and `video --edit` commands
+stable names for important moments.
+
+Example:
+  termctrl start demo --record captures/demo.termctrl -- opencode
+  termctrl wait demo \"Ask anything\"
+  termctrl mark demo ready
+  termctrl send demo text:/connect enter
+  termctrl mark demo after-connect";
 
 const MARKERS_HELP: &str = "\
 List named markers from a .termctrl recording. Use the timestamps to audit an edit plan, or inspect
@@ -147,6 +160,7 @@ enum Command {
     /// Resize a named live session.
     Resize(ResizeArgs),
     /// Add a named moment to an active recording for later editing.
+    #[command(after_help = MARK_HELP)]
     Mark(MarkArgs),
     /// List named moments in a recording.
     #[command(after_help = MARKERS_HELP)]
@@ -490,7 +504,7 @@ struct VideoArgs {
     /// Marker-based JSON edit plan with clips, captions, speeds, and holds.
     #[arg(long)]
     edit: Option<PathBuf>,
-    /// Hold the final frame for this duration.
+    /// Hold the final frame for this duration; use 0 for no artificial final pause.
     #[arg(long, default_value_t = 1000)]
     tail_ms: u64,
     /// Include leading contentless startup/terminal negotiation frames.

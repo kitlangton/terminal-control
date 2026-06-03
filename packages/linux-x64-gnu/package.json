@@ -1,13 +1,23 @@
 {
   "name": "@kitlangton/terminal-control-linux-x64-gnu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native termctrl binary for Terminal Control on Linux x64 GNU",
   "license": "MIT",
   "repository": "https://github.com/kitlangton/terminal-control",
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["glibc"],
-  "files": ["bin/termctrl", "README.md", "LICENSE"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin/termctrl",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "termctrl": "bin/termctrl"
   },

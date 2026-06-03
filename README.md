@@ -125,10 +125,10 @@ termctrl stop demo
 
 termctrl markers captures/demo.termctrl
 termctrl show --recording captures/demo.termctrl --at-marker after-answer
-termctrl video captures/demo.termctrl --edit captures/demo.json --hide-cursor --out captures/demo.mp4
+termctrl video captures/demo.termctrl --edit captures/demo.json --tail-ms 0 --hide-cursor --out captures/demo.mp4
 ```
 
-The marker-based edit plan is explicit and deterministic:
+The marker-based edit plan is explicit and deterministic. `speed` accelerates or slows the real recorded time inside that clip. `caption` adds a visible annotation row. `hold_ms` is optional and creates a deliberate still frame at the end of a clip; omit it when you do not want artificial freezes.
 
 ```json
 {
@@ -137,14 +137,13 @@ The marker-based edit plan is explicit and deterministic:
       "from": "before-prompt",
       "to": "after-answer",
       "speed": 4,
-      "hold_ms": 1200,
       "caption": "The agent answers inside the live terminal UI"
     }
   ]
 }
 ```
 
-Without `--edit`, video export preserves the observed recording timing. Edit plans are preferable for polished demos because they select intentional marker ranges and can accelerate animated spinner spans without relying on visual-idle heuristics. Identical rendered screens are rasterized once and reused during export. Video export trims startup frames before non-whitespace text by default while still preserving recordings that only paint terminal backgrounds; use `--include-startup` to keep all startup frames.
+Without `--edit`, video export preserves the observed recording timing. Edit plans are preferable for polished demos because they select intentional marker ranges and can accelerate animated spinner spans without relying on visual-idle heuristics. Identical rendered screens are rasterized once and reused during export. Video export trims startup frames before non-whitespace text by default while still preserving recordings that only paint terminal backgrounds; use `--include-startup` to keep all startup frames. `video` holds the final frame for one second by default so short recordings do not end abruptly; pass `--tail-ms 0` for a strict no-holds cut.
 
 Use `termctrl markers captures/demo.termctrl` to audit available marker names and timestamps. Use `termctrl show --recording captures/demo.termctrl --at-marker after-answer` or `--at-ms 1234` to inspect exact screens while tuning an edit plan.
 
