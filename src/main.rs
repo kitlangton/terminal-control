@@ -246,6 +246,11 @@ struct SourceArgs {
     /// Wait this long before allowing the initial screen to settle.
     #[arg(long)]
     initial_delay_ms: Option<u64>,
+    /// Delay in milliseconds between consecutive 4-byte chunks of `--send`
+    /// input. Mirrors the `send --pace-ms` flag. `0` (the default) is a
+    /// single batched send.
+    #[arg(long = "pace-ms", default_value_t = 0)]
+    pace_ms: u64,
     /// Wait until the visible terminal includes this text before interacting or capturing.
     #[arg(long)]
     wait_for: Option<String>,
@@ -634,6 +639,7 @@ fn main() -> Result<()> {
                     color: args.color.into(),
                     env: Default::default(),
                     inherit_env: true,
+                    input_pace: Duration::ZERO,
                 },
             )?;
         }
@@ -772,6 +778,7 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         color: color.into(),
         env: Default::default(),
         inherit_env: true,
+        input_pace: Duration::from_millis(args.pace_ms),
     };
     if args.pipe {
         shot_engine::from_pipe_command(&args.command, args.cwd.as_deref(), &options)
@@ -894,6 +901,7 @@ fn start_session(args: &StartArgs) -> Result<()> {
         color: args.color.into(),
         env: Default::default(),
         inherit_env: true,
+        input_pace: Duration::ZERO,
     };
     session::start(
         &args.name,

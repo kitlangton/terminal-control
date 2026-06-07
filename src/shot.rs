@@ -36,6 +36,12 @@ pub struct Options {
     pub env: BTreeMap<String, String>,
     /// Whether the terminal application inherits the parent process environment.
     pub inherit_env: bool,
+    /// Delay inserted between consecutive bytes of `input` when feeding the
+    /// observed command. `Duration::ZERO` (the default) preserves the
+    /// batched, fastest-possible send. Mirrors the `--pace-ms` flag on the
+    /// `send` command and lets the one-shot path keep the same
+    /// human-typing-style pacing as a recorded interaction.
+    pub input_pace: Duration,
 }
 
 impl Default for Options {
@@ -55,6 +61,7 @@ impl Default for Options {
             color: ColorMode::Auto,
             env: BTreeMap::new(),
             inherit_env: true,
+            input_pace: Duration::ZERO,
         }
     }
 }
@@ -162,7 +169,9 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
         if !closed && Instant::now() < clock.deadline && !options.input.is_empty() {
             // Once input is sent, the pre-input idle frame is no longer the shot target.
             clock.last_output = None;
-            host.send(&options.input)?;
+            // 4-byte chunks give roughly-character-by-character pacing for
+            // ASCII input, which is what human typing looks like to a TUI.
+            host.send_paced(&options.input, options.input_pace, 4)?;
             consume_until_settled(
                 &receive,
                 &mut terminal,
@@ -531,6 +540,24 @@ impl Host {
         self.writer.flush().context("flush terminal input")
     }
 
+    /// Like [`send`], but inserts `pace` between consecutive `chunk_size`
+    /// byte slices of `input`. `Duration::ZERO` is a single batched send.
+    pub(crate) fn send_paced(
+        &mut self,
+        input: &[u8],
+        pace: Duration,
+        chunk_size: usize,
+    ) -> Result<()> {
+        if pace.is_zero() || input.len() <= chunk_size {
+            return self.send(input);
+        }
+        for chunk in input.chunks(chunk_size) {
+            self.send(chunk)?;
+            thread::sleep(pace);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
         self.pixel_width = u32::from(cols) * u32::from(cell_width);
         self.pixel_height = u32::from(rows) * u32::from(cell_height);
@@ -653,6 +680,7 @@ mod tests {
                 color: ColorMode::Auto,
                 env: BTreeMap::new(),
                 inherit_env: true,
+                input_pace: Duration::ZERO,
             },
         )
         .unwrap();
@@ -703,6 +731,7 @@ mod tests {
                 color: ColorMode::Auto,
                 env: BTreeMap::new(),
                 inherit_env: true,
+                input_pace: Duration::ZERO,
             },
         );
 
@@ -722,5 +751,65 @@ mod tests {
     fn rejects_zero_terminal_geometry_before_parsing() {
         assert!(from_ansi(Vec::new(), 0, 1, 1).is_err());
         assert!(from_ansi(Vec::new(), 1, 0, 1).is_err());
+    }
+
+    fn recording_host() -> (Host, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let host = Host::new(
+            Box::new(Writer(buf.clone())),
+            &Options {
+                cols: 100,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 20,
+                settle: Duration::ZERO,
+                deadline: Duration::ZERO,
+                input: Vec::new(),
+                initial_delay: Duration::ZERO,
+                wait_for: None,
+                max_bytes: 1,
+                opentui_host: true,
+                color: ColorMode::Auto,
+                env: BTreeMap::new(),
+                inherit_env: true,
+                input_pace: Duration::ZERO,
+            },
+        );
+        (host, buf)
+    }
+
+    #[test]
+    fn send_paced_with_zero_pace_writes_in_one_batch() {
+        let (mut host, buf) = recording_host();
+        host.send_paced(b"abcdefgh", Duration::ZERO, 4).unwrap();
+        assert_eq!(*buf.lock().unwrap(), b"abcdefgh");
+    }
+
+    #[test]
+    fn send_paced_splits_into_chunks_and_sleeps_between() {
+        let (mut host, buf) = recording_host();
+        let pace = Duration::from_millis(20);
+        let start = Instant::now();
+        host.send_paced(b"abcdefgh", pace, 4).unwrap();
+        let elapsed = start.elapsed();
+        // 8 bytes / 4-byte chunk = 2 chunks; one sleep between them.
+        assert_eq!(*buf.lock().unwrap(), b"abcdefgh");
+        assert!(
+            elapsed >= pace,
+            "expected at least one pace delay, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn send_paced_skips_sleep_when_input_fits_in_one_chunk() {
+        let (mut host, buf) = recording_host();
+        let pace = Duration::from_millis(50);
+        let start = Instant::now();
+        host.send_paced(b"abc", pace, 4).unwrap();
+        assert_eq!(*buf.lock().unwrap(), b"abc");
+        assert!(
+            start.elapsed() < pace,
+            "single-chunk send should not sleep for pace"
+        );
     }
 }
