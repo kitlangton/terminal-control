@@ -492,7 +492,11 @@ fn consume_until_settled(
 }
 
 pub(crate) fn retain(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> Result<()> {
-    if ansi.len() + bytes.len() > max_bytes {
+    if ansi
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|total| total > max_bytes)
+    {
         bail!("terminal output exceeds --max-bytes ({max_bytes})");
     }
     ansi.extend_from_slice(bytes);
@@ -722,5 +726,24 @@ mod tests {
     fn rejects_zero_terminal_geometry_before_parsing() {
         assert!(from_ansi(Vec::new(), 0, 1, 1).is_err());
         assert!(from_ansi(Vec::new(), 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn retain_allows_appending_exactly_to_max_bytes() {
+        let mut buffer = b"abc".to_vec();
+
+        retain(&mut buffer, b"de", 5).unwrap();
+
+        assert_eq!(buffer, b"abcde");
+    }
+
+    #[test]
+    fn retain_rejects_over_max_bytes_without_mutating_buffer() {
+        let mut buffer = b"abc".to_vec();
+
+        let err = retain(&mut buffer, b"def", 5).unwrap_err();
+
+        assert_eq!(err.to_string(), "terminal output exceeds --max-bytes (5)");
+        assert_eq!(buffer, b"abc");
     }
 }

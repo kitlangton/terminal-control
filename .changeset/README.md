@@ -2,4 +2,4 @@
 
 `@kitlangton/terminal-control` and its native binary packages are published as one fixed-version group.
 
-The initial unpublished packages start at `0.1.0`. For later user-facing npm changes, create a changeset with `bunx changeset`, then use the release workflow to version and publish packages.
+For user-facing npm changes, create a changeset with `bun run changeset`, commit the generated metadata, run `bun run version-packages`, refresh `bun.lock`, commit the versioned package metadata, then dispatch the npm release workflow to validate and publish the fixed package set together.
